@@ -1,0 +1,878 @@
+---
+title: "Untitled"
+author: "Salma"
+date: "2026-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# COMPLETE DATA ANALYSIS PIPELINE
+# Models: MNLR, LASSO, Ridge, Elastic Net, RF, nnet NN, Keras NN
+# ══════════════════════════════════════════════════════════════════
+
+# ── LIBRARIES ─────────────────────────────────────────────────────
+library(caret)
+library(glmnet)
+library(nnet)
+library(randomForest)
+library(dplyr)
+library(tidyr)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 1: LOAD DATA
+# ══════════════════════════════════════════════════════════════════
+load("/Users/salma/Library/CloudStorage/OneDrive-UniversityofArizona/Desktop/Thesis_grad/scan_MNLR.RData")
+
+cat("Dataset loaded\n")
+cat("N =", nrow(scan), "\n")
+cat("Variables:", names(scan), "\n\n")
+
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 2: 80:20 STRATIFIED SPLIT
+# ══════════════════════════════════════════════════════════════════
+set.seed(123)
+trainIndex_80 <- createDataPartition(
+  scan$Behaviour_Coarse, p = 0.80, list = FALSE)
+train_80 <- scan[ trainIndex_80, ]
+test_20  <- scan[-trainIndex_80, ]
+
+cat("Train N =", nrow(train_80), "\n")
+cat("Test  N =", nrow(test_20),  "\n\n")
+
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3: FACTOR LEVELS AND REFERENCE CATEGORIES
+# ══════════════════════════════════════════════════════════════════
+
+# Behaviour — reference: Rest
+train_80$Behaviour_Coarse <- relevel(
+  as.factor(train_80$Behaviour_Coarse), ref = "Rest")
+test_20$Behaviour_Coarse <- factor(
+  test_20$Behaviour_Coarse,
+  levels = levels(train_80$Behaviour_Coarse))
+
+# Age — reference: Adult
+train_80$Age.Class <- relevel(
+  as.factor(train_80$Age.Class), ref = "Adult")
+test_20$Age.Class <- factor(
+  test_20$Age.Class,
+  levels = levels(train_80$Age.Class))
+
+# Sex — reference: Female
+train_80$Sex <- relevel(
+  as.factor(train_80$Sex), ref = "Female")
+test_20$Sex <- factor(
+  test_20$Sex,
+  levels = levels(train_80$Sex))
+
+# CRITICAL: Location levels — Forest → Roadside → RoadsideVeg
+train_80$Location_Coarse <- factor(
+  train_80$Location_Coarse,
+  levels = c("Forest", "Roadside", "RoadsideVeg"))
+test_20$Location_Coarse <- factor(
+  test_20$Location_Coarse,
+  levels = c("Forest", "Roadside", "RoadsideVeg"))
+
+cat("Factor levels set.\n")
+cat("Location:", levels(train_80$Location_Coarse), "\n")
+cat("Behaviour:", levels(train_80$Behaviour_Coarse), "\n\n")
+
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 4: CIRCULAR TIME ENCODING (k=1 Fourier)
+# ══════════════════════════════════════════════════════════════════
+train_80$hour     <- as.numeric(format(train_80$POSIX, "%H"))
+train_80$hour_sin <- sin(2 * pi * train_80$hour / 24)
+train_80$hour_cos <- cos(2 * pi * train_80$hour / 24)
+
+test_20$hour      <- as.numeric(format(test_20$POSIX, "%H"))
+test_20$hour_sin  <- sin(2 * pi * test_20$hour / 24)
+test_20$hour_cos  <- cos(2 * pi * test_20$hour / 24)
+
+cat("Circular time encoding done.\n\n")
+
+```
+
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 5: THREE-WAY INTERACTION MODEL MATRIX
+# ══════════════════════════════════════════════════════════════════
+X_train_80 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+  data = train_80)[, -1]
+
+X_test_20 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+  data = test_20)[, -1]
+
+y_train_80 <- train_80$Behaviour_Coarse
+y_test_20  <- test_20$Behaviour_Coarse
+
+cat("Model matrix dimensions:\n")
+cat("Train:", nrow(X_train_80), "x", ncol(X_train_80), "\n")
+cat("Test: ", nrow(X_test_20),  "x", ncol(X_test_20),  "\n\n")
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 6: EVALUATION METRIC FUNCTIONS
+# ══════════════════════════════════════════════════════════════════
+
+# One-hot encode y_test for probability metrics
+y_onehot_test <- model.matrix(
+  ~ y_test_20 - 1,
+  data = data.frame(y_test_20 = y_test_20))
+colnames(y_onehot_test) <- levels(y_test_20)
+
+# 0-1 Loss
+compute_01_loss <- function(pred_class, true_class) {
+  mean(pred_class != true_class)
+}
+
+# Log-Loss (multinomial cross-entropy)
+compute_logloss <- function(prob_mat, onehot_mat) {
+  eps  <- 1e-15
+  prob_mat <- pmax(pmin(as.matrix(prob_mat), 1-eps), eps)
+  -mean(rowSums(as.matrix(onehot_mat) * log(prob_mat)))
+}
+
+# Brier Score
+compute_brier <- function(prob_mat, onehot_mat) {
+  mean(rowSums((as.matrix(prob_mat) - as.matrix(onehot_mat))^2))
+}
+
+# Spherical Score
+compute_spherical <- function(prob_mat, onehot_mat) {
+  prob_mat <- as.matrix(prob_mat)
+  true_probs <- rowSums(prob_mat * as.matrix(onehot_mat))
+  norms      <- sqrt(rowSums(prob_mat^2))
+  mean(true_probs / norms)
+}
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 7: 5-FOLD CROSS-VALIDATION SETUP
+# ══════════════════════════════════════════════════════════════════
+set.seed(123)
+folds <- createFolds(y_train_80, k = 5, list = TRUE)
+cat("5-fold CV folds created.\n\n")
+
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 8: FIT MODELS
+# ══════════════════════════════════════════════════════════════════
+
+results <- list()
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 1: MNLR (unpenalised baseline)
+# ─────────────────────────────────────────────────────────────────
+cat("══════════════════════════════════════\n")
+cat("MODEL 1: MNLR\n")
+cat("══════════════════════════════════════\n")
+
+tryCatch({
+  mnlr_fit <- multinom(
+    Behaviour_Coarse ~ (Location_Coarse + Age.Class + Sex +
+                          hour_sin + hour_cos)^3,
+    data    = train_80,
+    MaxNWts = 10000,
+    maxit   = 500,
+    trace   = FALSE
+  )
+
+  prob_mnlr_test  <- predict(mnlr_fit, newdata = test_20, type = "probs")
+  pred_mnlr_test  <- predict(mnlr_fit, newdata = test_20, type = "class")
+
+  results$MNLR <- list(
+    test_01   = compute_01_loss(pred_mnlr_test, y_test_20),
+    test_ll   = compute_logloss(prob_mnlr_test, y_onehot_test),
+    test_br   = compute_brier(prob_mnlr_test, y_onehot_test),
+    test_sp   = compute_spherical(prob_mnlr_test, y_onehot_test)
+  )
+  cat("MNLR done.\n")
+  cat(sprintf("  Test 0-1 Loss: %.4f\n", results$MNLR$test_01))
+  cat(sprintf("  Test Log-Loss: %.4f\n", results$MNLR$test_ll))
+
+}, error = function(e) {
+  cat("MNLR failed:", conditionMessage(e), "\n")
+  results$MNLR <<- list(test_01=NA, test_ll=NA, test_br=NA, test_sp=NA)
+})
+
+```
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 2: LASSO (alpha = 1)
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 2: LASSO\n")
+cat("══════════════════════════════════════\n")
+
+# 5-fold CV for lambda selection
+set.seed(123)
+cv_errors_lasso <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx   <- folds[[f]]
+  X_tr      <- X_train_80[-val_idx, ]
+  X_val     <- X_train_80[ val_idx, ]
+  y_tr      <- y_train_80[-val_idx]
+  y_val     <- y_train_80[ val_idx]
+
+  fit_tmp   <- cv.glmnet(X_tr, y_tr, family="multinomial",
+                         alpha=1, nfolds=5)
+  pred_tmp  <- predict(fit_tmp, newx=X_val, s="lambda.min",
+                       type="class")[,1]
+  cv_errors_lasso[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_lasso), sd(cv_errors_lasso)))
+
+# Final fit on full training set
+set.seed(123)
+lasso_final_80 <- cv.glmnet(
+  x      = X_train_80,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 1,
+  nfolds = 10
+)
+
+# Test set evaluation
+prob_lasso_test <- predict(lasso_final_80, newx=X_test_20,
+                           s="lambda.min", type="response")[,,1]
+pred_lasso_test <- predict(lasso_final_80, newx=X_test_20,
+                           s="lambda.min", type="class")[,1]
+colnames(prob_lasso_test) <- levels(y_test_20)
+
+results$LASSO <- list(
+  cv_01     = mean(cv_errors_lasso),
+  cv_sd     = sd(cv_errors_lasso),
+  test_01   = compute_01_loss(pred_lasso_test, y_test_20),
+  test_ll   = compute_logloss(prob_lasso_test, y_onehot_test),
+  test_br   = compute_brier(prob_lasso_test, y_onehot_test),
+  test_sp   = compute_spherical(prob_lasso_test, y_onehot_test)
+)
+
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$LASSO$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$LASSO$test_ll))
+cat(sprintf("Test Brier:    %.4f\n", results$LASSO$test_br))
+cat(sprintf("Test Spherical:%.4f\n", results$LASSO$test_sp))
+cat(sprintf("lambda.min:    %.6f\n", lasso_final_80$lambda.min))
+
+# Sanity check — HD probabilities
+hour_fixed <- 8
+sanity_grid <- data.frame(
+  Location_Coarse = factor(
+    c("Forest","Roadside","RoadsideVeg"),
+    levels = c("Forest","Roadside","RoadsideVeg")),
+  Age.Class = factor("Adult",  levels = levels(train_80$Age.Class)),
+  Sex       = factor("Female", levels = levels(train_80$Sex)),
+  hour      = hour_fixed,
+  hour_sin  = sin(2*pi*hour_fixed/24),
+  hour_cos  = cos(2*pi*hour_fixed/24)
+)
+X_sanity <- model.matrix(
+  ~(Location_Coarse+Age.Class+Sex+hour_sin+hour_cos)^3,
+  data=sanity_grid)[,-1]
+prob_sanity <- predict(lasso_final_80, newx=X_sanity,
+                       s="lambda.min", type="response")[,,1]
+colnames(prob_sanity) <- levels(y_train_80)
+rownames(prob_sanity) <- c("Forest","Roadside","RoadsideVeg")
+cat("\nHD probabilities (Roadside must be highest):\n")
+print(round(prob_sanity[,"Human Directed", drop=FALSE], 3))
+
+```
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 3: RIDGE (alpha = 0)
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 3: RIDGE\n")
+cat("══════════════════════════════════════\n")
+
+cv_errors_ridge <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx  <- folds[[f]]
+  X_tr     <- X_train_80[-val_idx, ]
+  X_val    <- X_train_80[ val_idx, ]
+  y_tr     <- y_train_80[-val_idx]
+  y_val    <- y_train_80[ val_idx]
+
+  fit_tmp  <- cv.glmnet(X_tr, y_tr, family="multinomial",
+                        alpha=0, nfolds=5)
+  pred_tmp <- predict(fit_tmp, newx=X_val, s="lambda.min",
+                      type="class")[,1]
+  cv_errors_ridge[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_ridge), sd(cv_errors_ridge)))
+
+set.seed(123)
+ridge_final_80 <- cv.glmnet(
+  x      = X_train_80,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 0,
+  nfolds = 10
+)
+
+prob_ridge_test <- predict(ridge_final_80, newx=X_test_20,
+                           s="lambda.min", type="response")[,,1]
+pred_ridge_test <- predict(ridge_final_80, newx=X_test_20,
+                           s="lambda.min", type="class")[,1]
+colnames(prob_ridge_test) <- levels(y_test_20)
+
+results$Ridge <- list(
+  cv_01   = mean(cv_errors_ridge),
+  cv_sd   = sd(cv_errors_ridge),
+  test_01 = compute_01_loss(pred_ridge_test, y_test_20),
+  test_ll = compute_logloss(prob_ridge_test, y_onehot_test),
+  test_br = compute_brier(prob_ridge_test, y_onehot_test),
+  test_sp = compute_spherical(prob_ridge_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$Ridge$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$Ridge$test_ll))
+```
+
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 4: ELASTIC NET alpha = 0.5
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 4: ELASTIC NET (alpha=0.5)\n")
+cat("══════════════════════════════════════\n")
+
+cv_errors_en05 <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx  <- folds[[f]]
+  X_tr     <- X_train_80[-val_idx, ]
+  X_val    <- X_train_80[ val_idx, ]
+  y_tr     <- y_train_80[-val_idx]
+  y_val    <- y_train_80[ val_idx]
+
+  fit_tmp  <- cv.glmnet(X_tr, y_tr, family="multinomial",
+                        alpha=0.5, nfolds=5)
+  pred_tmp <- predict(fit_tmp, newx=X_val, s="lambda.min",
+                      type="class")[,1]
+  cv_errors_en05[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_en05), sd(cv_errors_en05)))
+
+set.seed(123)
+en05_final_80 <- cv.glmnet(
+  x      = X_train_80,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 0.5,
+  nfolds = 10
+)
+
+prob_en05_test <- predict(en05_final_80, newx=X_test_20,
+                          s="lambda.min", type="response")[,,1]
+pred_en05_test <- predict(en05_final_80, newx=X_test_20,
+                          s="lambda.min", type="class")[,1]
+colnames(prob_en05_test) <- levels(y_test_20)
+
+results$EN_05 <- list(
+  cv_01   = mean(cv_errors_en05),
+  cv_sd   = sd(cv_errors_en05),
+  test_01 = compute_01_loss(pred_en05_test, y_test_20),
+  test_ll = compute_logloss(prob_en05_test, y_onehot_test),
+  test_br = compute_brier(prob_en05_test, y_onehot_test),
+  test_sp = compute_spherical(prob_en05_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$EN_05$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$EN_05$test_ll))
+
+```
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 5: ELASTIC NET alpha = 0.7
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 5: ELASTIC NET (alpha=0.7)\n")
+cat("══════════════════════════════════════\n")
+
+cv_errors_en07 <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx  <- folds[[f]]
+  X_tr     <- X_train_80[-val_idx, ]
+  X_val    <- X_train_80[ val_idx, ]
+  y_tr     <- y_train_80[-val_idx]
+  y_val    <- y_train_80[ val_idx]
+
+  fit_tmp  <- cv.glmnet(X_tr, y_tr, family="multinomial",
+                        alpha=0.7, nfolds=5)
+  pred_tmp <- predict(fit_tmp, newx=X_val, s="lambda.min",
+                      type="class")[,1]
+  cv_errors_en07[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_en07), sd(cv_errors_en07)))
+
+set.seed(123)
+en07_final_80 <- cv.glmnet(
+  x      = X_train_80,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 0.7,
+  nfolds = 10
+)
+
+prob_en07_test <- predict(en07_final_80, newx=X_test_20,
+                          s="lambda.min", type="response")[,,1]
+pred_en07_test <- predict(en07_final_80, newx=X_test_20,
+                          s="lambda.min", type="class")[,1]
+colnames(prob_en07_test) <- levels(y_test_20)
+
+results$EN_07 <- list(
+  cv_01   = mean(cv_errors_en07),
+  cv_sd   = sd(cv_errors_en07),
+  test_01 = compute_01_loss(pred_en07_test, y_test_20),
+  test_ll = compute_logloss(prob_en07_test, y_onehot_test),
+  test_br = compute_brier(prob_en07_test, y_onehot_test),
+  test_sp = compute_spherical(prob_en07_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$EN_07$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$EN_07$test_ll))
+
+```
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 6: RANDOM FOREST
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 6: RANDOM FOREST\n")
+cat("══════════════════════════════════════\n")
+
+cv_errors_rf <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx  <- folds[[f]]
+  X_tr     <- X_train_80[-val_idx, ]
+  X_val    <- X_train_80[ val_idx, ]
+  y_tr     <- y_train_80[-val_idx]
+  y_val    <- y_train_80[ val_idx]
+
+  fit_tmp  <- randomForest(
+    x = X_tr, y = y_tr,
+    ntree = 500,
+    mtry  = floor(sqrt(ncol(X_tr))))
+  pred_tmp <- predict(fit_tmp, newdata=X_val, type="class")
+  cv_errors_rf[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_rf), sd(cv_errors_rf)))
+
+set.seed(123)
+rf_final_80 <- randomForest(
+  x     = X_train_80,
+  y     = y_train_80,
+  ntree = 500,
+  mtry  = floor(sqrt(ncol(X_train_80)))
+)
+
+prob_rf_test <- predict(rf_final_80, newdata=X_test_20, type="prob")
+pred_rf_test <- predict(rf_final_80, newdata=X_test_20, type="class")
+
+results$RF <- list(
+  cv_01   = mean(cv_errors_rf),
+  cv_sd   = sd(cv_errors_rf),
+  test_01 = compute_01_loss(pred_rf_test, y_test_20),
+  test_ll = compute_logloss(prob_rf_test, y_onehot_test),
+  test_br = compute_brier(prob_rf_test, y_onehot_test),
+  test_sp = compute_spherical(prob_rf_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$RF$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$RF$test_ll))
+```
+
+```{r}
+# ─────────────────────────────────────────────────────────────────
+# MODEL 7: NEURAL NETWORK (nnet)
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 7: NEURAL NETWORK (nnet)\n")
+cat("══════════════════════════════════════\n")
+
+# Normalise predictors for NN
+X_train_norm <- scale(X_train_80)
+X_test_norm  <- scale(X_test_20,
+                      center = attr(X_train_norm, "scaled:center"),
+                      scale  = attr(X_train_norm, "scaled:scale"))
+
+cv_errors_nn <- numeric(5)
+
+for (f in seq_along(folds)) {
+  val_idx  <- folds[[f]]
+  X_tr     <- X_train_norm[-val_idx, ]
+  X_val    <- X_train_norm[ val_idx, ]
+  y_tr     <- y_train_80[-val_idx]
+  y_val    <- y_train_80[ val_idx]
+
+  fit_tmp  <- nnet(
+    x       = X_tr,
+    y       = class.ind(y_tr),
+    size    = 5,
+    decay   = 0.1,
+    maxit   = 200,
+    softmax = TRUE,
+    trace   = FALSE
+  )
+  pred_tmp <- predict(fit_tmp, newdata=X_val, type="class")
+  cv_errors_nn[f] <- mean(pred_tmp != y_val)
+}
+
+cat(sprintf("CV 0-1 Loss: %.4f (SD: %.4f)\n",
+            mean(cv_errors_nn), sd(cv_errors_nn)))
+
+set.seed(123)
+nn_final_80 <- nnet(
+  x       = X_train_norm,
+  y       = class.ind(y_train_80),
+  size    = 5,
+  decay   = 0.1,
+  maxit   = 500,
+  softmax = TRUE,
+  trace   = FALSE
+)
+
+prob_nn_test <- predict(nn_final_80, newdata=X_test_norm, type="raw")
+colnames(prob_nn_test) <- levels(y_train_80)
+pred_nn_test <- levels(y_train_80)[apply(prob_nn_test, 1, which.max)]
+
+results$NN <- list(
+  cv_01   = mean(cv_errors_nn),
+  cv_sd   = sd(cv_errors_nn),
+  test_01 = compute_01_loss(pred_nn_test, y_test_20),
+  test_ll = compute_logloss(prob_nn_test, y_onehot_test),
+  test_br = compute_brier(prob_nn_test, y_onehot_test),
+  test_sp = compute_spherical(prob_nn_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$NN$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$NN$test_ll))
+
+```
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL 8: KERAS DEEP NEURAL NETWORK
+# ─────────────────────────────────────────────────────────────────
+cat("\n══════════════════════════════════════\n")
+cat("MODEL 8: KERAS DEEP NEURAL NETWORK\n")
+cat("══════════════════════════════════════\n")
+
+library(keras)
+
+# One-hot encode outcomes for keras
+n_classes   <- length(levels(y_train_80))
+y_train_int <- as.integer(y_train_80) - 1L
+y_test_int  <- as.integer(y_test_20)  - 1L
+y_train_oh  <- to_categorical(y_train_int, num_classes = n_classes)
+y_test_oh   <- to_categorical(y_test_int,  num_classes = n_classes)
+
+X_train_k   <- as.matrix(X_train_norm)
+X_test_k    <- as.matrix(X_test_norm)
+
+# Grid search parameters
+grid <- expand.grid(
+  layer1  = c(8, 16, 32),
+  layer2  = c(0, 4, 8),
+  dropout = c(0, 0.2, 0.3),
+  l2_reg  = c(0.001, 0.01),
+  stringsAsFactors = FALSE
+)
+
+cat(sprintf("Grid search: %d architectures\n", nrow(grid)))
+
+best_cv_error <- Inf
+best_params   <- NULL
+grid_results  <- data.frame()
+
+for (i in seq_len(nrow(grid))) {
+
+  p <- grid[i, ]
+
+  # Build model
+  build_model <- function(l1, l2_nodes, do, l2r) {
+    model <- keras_model_sequential()
+    model %>%
+      layer_dense(units       = l1,
+                  activation  = "relu",
+                  input_shape = ncol(X_train_k),
+                  kernel_regularizer = regularizer_l2(l2r))
+    if (do > 0) model %>% layer_dropout(rate = do)
+    if (l2_nodes > 0) {
+      model %>%
+        layer_dense(units      = l2_nodes,
+                    activation = "relu",
+                    kernel_regularizer = regularizer_l2(l2r))
+      if (do > 0) model %>% layer_dropout(rate = do)
+    }
+    model %>%
+      layer_dense(units      = n_classes,
+                  activation = "softmax")
+    model %>% compile(
+      loss      = "categorical_crossentropy",
+      optimizer = optimizer_adam(),
+      metrics   = c("accuracy")
+    )
+    model
+  }
+
+  # 5-fold CV
+  fold_errors <- numeric(5)
+  for (f in seq_along(folds)) {
+    val_idx <- folds[[f]]
+    X_tr_k  <- X_train_k[-val_idx, ]
+    X_val_k <- X_train_k[ val_idx, ]
+    y_tr_k  <- y_train_oh[-val_idx, ]
+    y_val_k <- y_train_oh[ val_idx, ]
+
+    m <- build_model(p$layer1, p$layer2, p$dropout, p$l2_reg)
+    m %>% fit(
+      X_tr_k, y_tr_k,
+      epochs          = 50,
+      batch_size      = 32,
+      validation_data = list(X_val_k, y_val_k),
+      verbose         = 0
+    )
+    preds <- m %>% predict(X_val_k)
+    pred_class <- levels(y_train_80)[apply(preds, 1, which.max)]
+    true_class <- y_train_80[val_idx]
+    fold_errors[f] <- mean(pred_class != true_class)
+  }
+
+  cv_err <- mean(fold_errors)
+  grid_results <- rbind(grid_results, data.frame(
+    layer1=p$layer1, layer2=p$layer2,
+    dropout=p$dropout, l2_reg=p$l2_reg,
+    cv_error=cv_err))
+
+  cat(sprintf("  [%2d/%d] L1=%2d L2=%d DO=%.1f L2R=%.3f → CV=%.4f\n",
+              i, nrow(grid),
+              p$layer1, p$layer2, p$dropout, p$l2_reg, cv_err))
+
+  if (cv_err < best_cv_error) {
+    best_cv_error <- cv_err
+    best_params   <- p
+  }
+}
+
+cat(sprintf("\nBest architecture: Layer1=%d Layer2=%d Dropout=%.1f L2=%.3f\n",
+            best_params$layer1, best_params$layer2,
+            best_params$dropout, best_params$l2_reg))
+cat(sprintf("Best CV Error: %.4f\n\n", best_cv_error))
+
+# Save grid results
+write.csv(grid_results, "keras_deep_nn_gridsearch.csv", row.names=FALSE)
+
+# Refit best architecture on full training set
+keras_final_80 <- build_model(
+  best_params$layer1,
+  best_params$layer2,
+  best_params$dropout,
+  best_params$l2_reg
+)
+
+keras_final_80 %>% fit(
+  X_train_k, y_train_oh,
+  epochs     = 100,
+  batch_size = 32,
+  verbose    = 0
+)
+
+prob_keras_test <- keras_final_80 %>% predict(X_test_k)
+colnames(prob_keras_test) <- levels(y_train_80)
+pred_keras_test <- levels(y_train_80)[apply(prob_keras_test, 1, which.max)]
+
+results$Keras <- list(
+  cv_01   = best_cv_error,
+  cv_sd   = NA,
+  test_01 = compute_01_loss(pred_keras_test, y_test_20),
+  test_ll = compute_logloss(prob_keras_test, y_onehot_test),
+  test_br = compute_brier(prob_keras_test, y_onehot_test),
+  test_sp = compute_spherical(prob_keras_test, y_onehot_test)
+)
+cat(sprintf("Test 0-1 Loss: %.4f\n", results$Keras$test_01))
+cat(sprintf("Test Log-Loss: %.4f\n", results$Keras$test_ll))
+
+# Save best model
+keras_final_80 %>% save_model_hdf5("keras_best_model.h5")
+cat("Keras model saved: keras_best_model.h5\n")
+
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# STEP 9: MODEL COMPARISON TABLE
+# ══════════════════════════════════════════════════════════════════
+cat("\n")
+cat("══════════════════════════════════════════════════════════════\n")
+cat("MODEL COMPARISON — FINAL RESULTS\n")
+cat("══════════════════════════════════════════════════════════════\n\n")
+
+model_names <- c("MNLR","LASSO","Ridge","EN_05","EN_07","RF","NN","Keras")
+
+cat(sprintf("%-10s  %8s  %8s  %8s  %8s  %8s  %8s\n",
+            "Model","CV Loss","CV SD","Test 0-1","Log-Loss",
+            "Brier","Spherical"))
+cat(strrep("-", 72), "\n")
+
+for (nm in model_names) {
+  r <- results[[nm]]
+  if (is.null(r)) {
+    cat(sprintf("%-10s  %8s  %8s  %8s  %8s  %8s  %8s\n",
+                nm, "FAILED","—","—","—","—","—"))
+    next
+  }
+  cat(sprintf("%-10s  %8s  %8s  %8.4f  %8.4f  %8.4f  %8.4f\n",
+              nm,
+              ifelse(is.null(r$cv_01)||is.na(r$cv_01), "    NA",
+                     sprintf("%.4f", r$cv_01)),
+              ifelse(is.null(r$cv_sd)||is.na(r$cv_sd), "    NA",
+                     sprintf("%.4f", r$cv_sd)),
+              r$test_01, r$test_ll, r$test_br, r$test_sp))
+}
+cat(strrep("-", 72), "\n\n")
+
+# Build comparison dataframe safely
+rows <- list()
+for (nm in model_names) {
+  r <- results[[nm]]
+  rows[[nm]] <- data.frame(
+    Model     = nm,
+    CV_01Loss = ifelse(is.null(r) || is.null(r$cv_01), NA, r$cv_01),
+    CV_SD     = ifelse(is.null(r) || is.null(r$cv_sd), NA, r$cv_sd),
+    Test_01   = ifelse(is.null(r), NA, r$test_01),
+    LogLoss   = ifelse(is.null(r), NA, r$test_ll),
+    Brier     = ifelse(is.null(r), NA, r$test_br),
+    Spherical = ifelse(is.null(r), NA, r$test_sp),
+    stringsAsFactors = FALSE
+  )
+}
+
+comp_df <- bind_rows(rows)
+write.csv(comp_df, "model_comparison_results.csv", row.names = FALSE)
+cat("Saved: model_comparison_results.csv\n")
+```
+
+
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 9: MODEL COMPARISON TABLE
+# ══════════════════════════════════════════════════════════════════
+cat("\n")
+cat("══════════════════════════════════════════════════════════════\n")
+cat("MODEL COMPARISON — FINAL RESULTS\n")
+cat("══════════════════════════════════════════════════════════════\n\n")
+
+model_names <- c("MNLR","LASSO","Ridge","EN_05","EN_07","RF","NN","Keras")
+
+cat(sprintf("%-10s  %8s  %8s  %8s  %8s  %8s  %8s\n",
+            "Model","CV Loss","CV SD","Test 0-1","Log-Loss","Brier","Spherical"))
+cat(strrep("-", 70), "\n")
+
+for (nm in model_names) {
+  r <- results[[nm]]
+  if (is.null(r)) next
+  cat(sprintf("%-10s  %8s  %8s  %8.4f  %8.4f  %8.4f  %8.4f\n",
+              nm,
+              ifelse(is.na(r$cv_01), "    NA", sprintf("%.4f", r$cv_01)),
+              ifelse(is.null(r$cv_sd)||is.na(r$cv_sd), "    NA",
+                     sprintf("%.4f", r$cv_sd)),
+              r$test_01, r$test_ll, r$test_br, r$test_sp))
+}
+
+cat(strrep("-", 70), "\n")
+cat("Lower 0-1 Loss, Log-Loss, Brier = better\n")
+cat("Higher Spherical = better\n\n")
+
+# Save comparison table
+comp_df <- data.frame(
+  Model     = model_names,
+  CV_01Loss = sapply(model_names, function(n) results[[n]]$cv_01),
+  CV_SD     = sapply(model_names, function(n) {
+    s <- results[[n]]$cv_sd
+    ifelse(is.null(s), NA, s)
+  }),
+  Test_01   = sapply(model_names, function(n) results[[n]]$test_01),
+  LogLoss   = sapply(model_names, function(n) results[[n]]$test_ll),
+  Brier     = sapply(model_names, function(n) results[[n]]$test_br),
+  Spherical = sapply(model_names, function(n) results[[n]]$test_sp)
+)
+
+write.csv(comp_df, "model_comparison_results.csv", row.names=FALSE)
+cat("Saved: model_comparison_results.csv\n")
+
+cat("\n══════════════════════════════════════════════════════════════\n")
+cat("ANALYSIS COMPLETE\n")
+cat("══════════════════════════════════════════════════════════════\n")
+cat("Key objects in environment:\n")
+cat("  lasso_final_80  — final LASSO model\n")
+cat("  rf_final_80     — final Random Forest model\n")
+cat("  nn_final_80     — final nnet Neural Network\n")
+cat("  keras_final_80  — final Keras Deep NN\n")
+cat("  train_80        — training data with hour/hour_sin/hour_cos\n")
+cat("  test_20         — test data\n")
+cat("  X_train_80      — 36-col training matrix\n")
+cat("  X_test_20       — 36-col test matrix\n")
+cat("  y_train_80      — training outcome factor\n")
+cat("  y_test_20       — test outcome factor\n")
+```
+
+
+
+```{r}
+
+```
+

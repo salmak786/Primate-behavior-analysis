@@ -1,0 +1,1978 @@
+---
+title: "Untitled"
+author: "Salma"
+date: "2026-04-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(caret)
+library(glmnet)
+load("/Users/salma/Library/CloudStorage/OneDrive-UniversityofArizona/Desktop/Thesis_grad/scan_MNLR.RData")
+head(scan)
+```
+
+
+```{r }
+
+
+# ── STEP 2: 80:20 split ───────────────────────────────────────────
+set.seed(123)
+trainIndex_80 <- createDataPartition(
+  scan$Behaviour_Coarse, p = 0.80, list = FALSE)
+train_80 <- scan[ trainIndex_80, ]
+test_20  <- scan[-trainIndex_80, ]
+
+```
+
+```{r}
+
+# ── STEP 3: Factor reference levels ──────────────────────────────
+train_80$Behaviour_Coarse <- relevel(
+  as.factor(train_80$Behaviour_Coarse), ref = "Rest")
+train_80$Age.Class <- relevel(
+  as.factor(train_80$Age.Class), ref = "Adult")
+train_80$Sex <- relevel(
+  as.factor(train_80$Sex), ref = "Female")
+
+test_20$Behaviour_Coarse <- factor(
+  test_20$Behaviour_Coarse, levels = levels(train_80$Behaviour_Coarse))
+test_20$Age.Class <- factor(
+  test_20$Age.Class, levels = levels(train_80$Age.Class))
+test_20$Sex <- factor(
+  test_20$Sex, levels = levels(train_80$Sex))
+```
+
+
+```{r}
+
+# ── STEP 4: CRITICAL — set location levels CORRECTLY ─────────────
+# Do this BEFORE model.matrix — this is the key fix
+train_80$Location_Coarse <- factor(
+  train_80$Location_Coarse,
+  levels = c("Forest", "Roadside", "RoadsideVeg")
+)
+test_20$Location_Coarse <- factor(
+  test_20$Location_Coarse,
+  levels = c("Forest", "Roadside", "RoadsideVeg")
+)
+
+# Verify
+cat("Location levels (must be Forest, Roadside, RoadsideVeg):\n")
+print(levels(train_80$Location_Coarse))
+```
+
+
+```{r}
+
+# ── STEP 5: Circular time encoding ───────────────────────────────
+train_80$hour     <- as.numeric(format(train_80$POSIX, "%H"))
+train_80$hour_sin <- sin(2 * pi * train_80$hour / 24)
+train_80$hour_cos <- cos(2 * pi * train_80$hour / 24)
+
+test_20$hour      <- as.numeric(format(test_20$POSIX, "%H"))
+test_20$hour_sin  <- sin(2 * pi * test_20$hour / 24)
+test_20$hour_cos  <- cos(2 * pi * test_20$hour / 24)
+
+```
+
+
+```{r}
+
+# ── STEP 6: Build model matrix ───────────────────────────────────
+X_train_80 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+  data = train_80)[, -1]
+
+X_test_20 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+  data = test_20)[, -1]
+
+y_train_80 <- train_80$Behaviour_Coarse
+y_test_20  <- test_20$Behaviour_Coarse
+
+cat("Matrix dimensions:\n")
+cat("Train:", nrow(X_train_80), "x", ncol(X_train_80), "\n")
+cat("Test: ", nrow(X_test_20),  "x", ncol(X_test_20),  "\n")
+```
+
+```{r}
+
+# ── STEP 7: Refit LASSO 
+set.seed(123)
+lasso_final_80 <- cv.glmnet(
+  x      = X_train_80,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 1,
+  nfolds = 10
+)
+
+cat("LASSO retrained. lambda.min =", lasso_final_80$lambda.min, "\n")
+```
+
+```{r}
+# ── STEP 7: Count non-zero coefficients ──────────────────────────
+beta    <- lasso_final_80$glmnet.fit$beta
+lam_idx <- which.min(abs(
+  lasso_final_80$glmnet.fit$lambda - lasso_final_80$lambda.min))
+
+cat("\nNon-zero coefficients at lambda.min:\n")
+total <- 0
+for (nm in names(beta)) {
+  nz <- sum(beta[[nm]][, lam_idx] != 0)
+  cat(sprintf("  %-20s: %d\n", nm, nz))
+  total <- total + nz
+}
+cat(sprintf("\nTotal non-zero: %d\n", total))
+cat(sprintf("Total possible: %d (36 predictors x 4 classes)\n", 36*4))
+```
+
+```{r}
+
+# ── STEP 8: Verify HD probabilities are now correct ───────────────
+hour_fixed <- 8
+test_locs <- data.frame(
+  Location_Coarse = factor(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    levels = c("Forest", "Roadside", "RoadsideVeg")
+  ),
+  Age.Class = factor("Adult",  levels = levels(train_80$Age.Class)),
+  Sex       = factor("Female", levels = levels(train_80$Sex)),
+  hour      = hour_fixed,
+  hour_sin  = sin(2 * pi * hour_fixed / 24),
+  hour_cos  = cos(2 * pi * hour_fixed / 24)
+)
+
+X_check <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+  data = test_locs)[, -1]
+
+prob_check <- predict(lasso_final_80,
+                      newx = X_check,
+                      s    = "lambda.min",
+                      type = "response")[,,1]
+colnames(prob_check) <- levels(y_train_80)
+rownames(prob_check) <- c("Forest", "Roadside", "RoadsideVeg")
+
+cat("\nHuman Directed probabilities (Roadside must be highest):\n")
+print(round(prob_check[, "Human Directed", drop = FALSE], 3))
+
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+# Reextract model after retraining
+lasso_fit   <- lasso_final_80$glmnet.fit
+best_lambda <- lasso_final_80$lambda.min
+
+# Run curves only first to verify
+fig1a <- make_fig1_curves("Adult",    "Female", "fig1a")
+fig1b <- make_fig1_curves("Adult",    "Male",   "fig1b")
+fig1c <- make_fig1_curves("Subadult", "Female", "fig1c")
+fig1d <- make_fig1_curves("Subadult", "Male",   "fig1d")
+```
+```{r}
+getwd()
+
+
+# Then move the file there in Finder, or set working directory to where the file is:
+setwd("/Users/salma/Library/CloudStorage/OneDrive-UniversityofArizona/Desktop/Thesis_grad/")
+
+# Then source works without full path
+source("fig1_bootstrap_ci.R")
+```
+
+
+```{r}
+# ── Set N_BOOT low for quick test first ──────────────────────────
+N_BOOT     <- 50   # change to 500 for final run
+hours_fine <- seq(8, 18, by = 0.5)
+beh_levels <- levels(y_train_80)
+margin     <- ggplot2::margin
+
+loc_colors <- c(
+  "Forest"      = "#1D9E75",
+  "Roadside"    = "#E24B4A",
+  "RoadsideVeg" = "#7F77DD"
+)
+
+lasso_fit   <- lasso_final_80$glmnet.fit
+best_lambda <- lasso_final_80$lambda.min
+
+make_time_grid <- function(age, sex, loc) {
+  data.frame(
+    Location_Coarse = factor(loc,
+                             levels = c("Forest","Roadside","RoadsideVeg")),
+    Age.Class       = factor(age,  levels = levels(train_80$Age.Class)),
+    Sex             = factor(sex,  levels = levels(train_80$Sex)),
+    hour            = hours_fine,
+    hour_sin        = sin(2 * pi * hours_fine / 24),
+    hour_cos        = cos(2 * pi * hours_fine / 24)
+  )
+}
+
+get_probs <- function(grid, fit = lasso_fit, lam = best_lambda) {
+  X_new <- model.matrix(
+    ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+    data = grid
+  )[, -1]
+  prob <- predict(fit, newx = X_new, s = lam,
+                  type = "response")[,,1]
+  colnames(prob) <- beh_levels
+  df          <- as.data.frame(prob)
+  df$Hour     <- grid$hour
+  df$Location <- as.character(grid$Location_Coarse[1])
+  df
+}
+
+get_point_estimates <- function(age, sex) {
+  bind_rows(lapply(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    function(loc) get_probs(make_time_grid(age, sex, loc))
+  ))
+}
+
+obs_props <- function(age, sex) {
+  totals <- train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour) |>
+    summarise(n_total = n(), .groups = "drop")
+  train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour, Behaviour_Coarse) |>
+    summarise(n_beh = n(), .groups = "drop") |>
+    left_join(totals, by = c("Location_Coarse", "hour")) |>
+    mutate(prop = n_beh / n_total) |>
+    filter(n_total >= 2) |>
+    rename(Behaviour = Behaviour_Coarse,
+           Hour      = hour,
+           Location  = Location_Coarse)
+}
+
+boot_ci_time <- function(age, sex, n_boot = N_BOOT) {
+  locs    <- c("Forest", "Roadside", "RoadsideVeg")
+  results <- list()
+  for (loc in locs) {
+    sub   <- train_80 |>
+      filter(Age.Class == age, Sex == sex,
+             Location_Coarse == loc)
+    n_sub <- nrow(sub)
+    if (n_sub < 3) {
+      cat(sprintf("  Skipping %s %s %s — n=%d\n", age, sex, loc, n_sub))
+      next
+    }
+    n_hours  <- length(hours_fine)
+    boot_mat <- array(NA,
+                      dim      = c(n_boot, n_hours, length(beh_levels)),
+                      dimnames = list(NULL, NULL, beh_levels))
+    n_success <- 0
+    for (b in seq_len(n_boot)) {
+      idx_boot   <- sample(seq_len(nrow(train_80)), replace = TRUE)
+      train_boot <- train_80[idx_boot, ]
+      # CRITICAL: re-enforce factor levels after resampling
+      train_boot$Location_Coarse <- factor(
+        train_boot$Location_Coarse,
+        levels = c("Forest", "Roadside", "RoadsideVeg"))
+      train_boot$Age.Class <- factor(
+        train_boot$Age.Class,
+        levels = levels(train_80$Age.Class))
+      train_boot$Sex <- factor(
+        train_boot$Sex,
+        levels = levels(train_80$Sex))
+      train_boot$Behaviour_Coarse <- factor(
+        train_boot$Behaviour_Coarse,
+        levels = levels(train_80$Behaviour_Coarse))
+      X_boot <- tryCatch(
+        model.matrix(
+          ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+          data = train_boot)[, -1],
+        error = function(e) NULL)
+      if (is.null(X_boot)) next
+      y_boot <- train_boot$Behaviour_Coarse
+      fit_boot <- tryCatch(
+        cv.glmnet(x = X_boot, y = y_boot,
+                  family = "multinomial", alpha = 1, nfolds = 5),
+        error = function(e) NULL)
+      if (is.null(fit_boot)) next
+      grid <- make_time_grid(age, sex, loc)
+      prob <- tryCatch(
+        get_probs(grid,
+                  fit = fit_boot$glmnet.fit,
+                  lam = fit_boot$lambda.min),
+        error = function(e) NULL)
+      if (is.null(prob)) next
+      boot_mat[b, , ] <- as.matrix(prob[, beh_levels])
+      n_success <- n_success + 1
+    }
+    cat(sprintf("  Bootstrap done: %s %s %s (n=%d, %d/%d ok)\n",
+                age, sex, loc, n_sub, n_success, n_boot))
+    ci_list <- lapply(seq_along(beh_levels), function(k) {
+      vals <- boot_mat[, , k]
+      vals <- vals[complete.cases(vals), , drop = FALSE]
+      data.frame(
+        Hour      = hours_fine,
+        Behaviour = beh_levels[k],
+        Lower     = apply(vals, 2, quantile, 0.025, na.rm = TRUE),
+        Upper     = apply(vals, 2, quantile, 0.975, na.rm = TRUE),
+        Location  = loc)
+    })
+    results[[loc]] <- bind_rows(ci_list)
+  }
+  bind_rows(results)
+}
+
+make_fig1_boot <- function(age, sex, fig_label) {
+  cat(sprintf("\nBuilding %s (%s %s)...\n", fig_label, age, sex))
+  fig_letter <- substr(fig_label, nchar(fig_label), nchar(fig_label))
+  point_df <- get_point_estimates(age, sex) |>
+    pivot_longer(cols = all_of(beh_levels),
+                 names_to = "Behaviour", values_to = "Prob") |>
+    mutate(Behaviour = factor(Behaviour, levels = beh_levels),
+           Location  = factor(Location,
+                              levels = c("Forest","Roadside","RoadsideVeg")))
+  ci_df <- boot_ci_time(age, sex) |>
+    mutate(Behaviour = factor(Behaviour, levels = beh_levels),
+           Location  = factor(Location,
+                              levels = c("Forest","Roadside","RoadsideVeg")))
+  ribbon_df <- ci_df |>
+    left_join(point_df, by = c("Hour", "Behaviour", "Location"))
+  obs_df <- obs_props(age, sex) |>
+    mutate(Behaviour = factor(Behaviour, levels = beh_levels),
+           Location  = factor(Location,
+                              levels = c("Forest","Roadside","RoadsideVeg")))
+  p <- ggplot() +
+geom_errorbar(
+  data  = ribbon_df,
+  aes(x    = Hour,
+      ymin = Lower,
+      ymax = Upper,
+      color = Location),
+  width     = 0.3,    # width of the horizontal caps
+  linewidth = 0.5,
+  alpha     = 0.7
+) +
+    geom_line(data = point_df,
+              aes(x = Hour, y = Prob, color = Location),
+              linewidth = 1.1) +
+    geom_point(data = obs_df,
+               aes(x = Hour, y = prop, color = Location),
+               size = 2.5, shape = 21, fill = "white",
+               stroke = 1.2, alpha = 0.85) +
+    facet_wrap(~ Behaviour, nrow = 1, scales = "free_y") +
+    scale_color_manual(values = loc_colors, name = "Location") +
+    scale_x_continuous(
+      limits = c(8, 18),
+      breaks = c(8, 12, 18),
+      labels = c("08:00","12:00","18:00")) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      expand = expansion(mult = c(0.02, 0.10))) +
+    labs(
+      title    = sprintf(
+        "Fig. 1%s \u2014 Predicted probability of behaviour across time of day (%s %s)",
+        fig_letter, age, sex),
+      subtitle = paste0("Age = ", age, " \u00b7 Sex = ", sex,
+        " \u00b7 curves = LASSO predictions",
+        " \u00b7 shading = bootstrap 95% CI (n=", N_BOOT, ")",
+        " \u00b7 circles = observed proportions (n \u2265 2)"),
+      x       = "Hour of day",
+      y       = "Probability of Behaviour",
+      caption = "Unweighted LASSO \u00b7 \u03bb = lambda.min \u00b7 Green = Forest \u00b7 Red = Roadside \u00b7 Purple = RoadsideVeg") +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+      strip.text       = element_text(size = 10, face = "bold", color = "grey15"),
+      strip.background = element_rect(fill = "grey97", color = "grey88"),
+      axis.text.x      = element_text(angle = 30, hjust = 1, size = 8.5),
+      axis.text.y      = element_text(size = 9),
+      legend.position  = "top",
+      legend.title     = element_text(size = 9.5, face = "bold"),
+      legend.text      = element_text(size = 9.5),
+      plot.title       = element_text(size = 11, face = "bold", color = "grey10"),
+      plot.subtitle    = element_text(size = 8.5, color = "grey45"),
+      plot.caption     = element_text(size = 7.5, color = "grey55", hjust = 0),
+      plot.margin      = unit(c(10, 10, 8, 10), "pt"))
+  fname <- sprintf("fig1%s_%s_%s_boot.png",
+                   fig_letter, tolower(age), tolower(sex))
+  ggsave(fname, plot = p, width = 15, height = 6, dpi = 300, bg = "white")
+  cat(sprintf("Saved: %s\n", fname))
+  p
+}
+
+# ── Run all 4 figures (N_BOOT=50 for test, change to 500 for final)
+set.seed(123)
+fig1a_boot <- make_fig1_boot("Adult",    "Female", "fig1a")
+fig1b_boot <- make_fig1_boot("Adult",    "Male",   "fig1b")
+fig1c_boot <- make_fig1_boot("Subadult", "Female", "fig1c")
+fig1d_boot <- make_fig1_boot("Subadult", "Male",   "fig1d")
+
+cat("\nAll Fig 1 bootstrap plots complete.\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# FIG 1 — Predicted probability across time of day
+# Bootstrap 95% CI on LASSO curve by refitting on resamples
+# Hours: 08:00–18:00
+# All 4 Age×Sex combinations
+# ══════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+
+margin     <- ggplot2::margin
+set.seed(123)
+
+N_BOOT     <- 500   # set to 50 for quick test
+hours_fine <- seq(8, 18, by = 0.5)
+beh_levels <- levels(y_train_80)
+
+loc_colors <- c(
+  "Forest"      = "#1D9E75",
+  "Roadside"    = "#E24B4A",
+  "RoadsideVeg" = "#7F77DD"
+)
+
+# ── Extract fitted model ──────────────────────────────────────────
+lasso_fit   <- lasso_final_80$glmnet.fit
+best_lambda <- lasso_final_80$lambda.min
+
+# ── Build prediction grid ─────────────────────────────────────────
+make_time_grid <- function(age, sex, loc) {
+  data.frame(
+    Location_Coarse = factor(loc,
+                             levels = c("Forest","Roadside","RoadsideVeg")),
+    Age.Class       = factor(age,  levels = levels(train_80$Age.Class)),
+    Sex             = factor(sex,  levels = levels(train_80$Sex)),
+    hour            = hours_fine,
+    hour_sin        = sin(2 * pi * hours_fine / 24),
+    hour_cos        = cos(2 * pi * hours_fine / 24)
+  )
+}
+
+# ── Get LASSO predicted probabilities ────────────────────────────
+get_probs <- function(grid, fit = lasso_fit, lam = best_lambda) {
+  X_new <- model.matrix(
+    ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+    data = grid
+  )[, -1]
+  prob <- predict(fit,
+                  newx = X_new,
+                  s    = lam,
+                  type = "response")[,,1]
+  colnames(prob) <- beh_levels
+  df          <- as.data.frame(prob)
+  df$Hour     <- grid$hour
+  df$Location <- as.character(grid$Location_Coarse[1])
+  df
+}
+
+# ── Point estimates for all 3 locations ──────────────────────────
+get_point_estimates <- function(age, sex) {
+  bind_rows(lapply(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    function(loc) get_probs(make_time_grid(age, sex, loc))
+  ))
+}
+
+# ── Observed proportions (circles) ───────────────────────────────
+obs_props <- function(age, sex) {
+  totals <- train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour) |>
+    summarise(n_total = n(), .groups = "drop")
+
+  train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour, Behaviour_Coarse) |>
+    summarise(n_beh = n(), .groups = "drop") |>
+    left_join(totals, by = c("Location_Coarse", "hour")) |>
+    mutate(prop = n_beh / n_total) |>
+    filter(n_total >= 2) |>
+    rename(Behaviour = Behaviour_Coarse,
+           Hour      = hour,
+           Location  = Location_Coarse)
+}
+
+# ── Bootstrap CI ─────────────────────────────────────────────────
+# Resamples full training data, refits LASSO each time,
+# predicts curve, gets 2.5/97.5 percentiles across resamples
+# Factor levels enforced inside loop — prevents Roadside/RoadsideVeg swap
+
+boot_ci_time <- function(age, sex, n_boot = N_BOOT) {
+
+  locs    <- c("Forest", "Roadside", "RoadsideVeg")
+  results <- list()
+
+  for (loc in locs) {
+
+    sub   <- train_80 |>
+      filter(Age.Class == age,
+             Sex        == sex,
+             Location_Coarse == loc)
+
+    n_sub <- nrow(sub)
+    if (n_sub < 3) {
+      cat(sprintf("  Skipping %s %s %s — n=%d\n",
+                  age, sex, loc, n_sub))
+      next
+    }
+
+    n_hours  <- length(hours_fine)
+    boot_mat <- array(NA,
+                      dim      = c(n_boot, n_hours, length(beh_levels)),
+                      dimnames = list(NULL, NULL, beh_levels))
+
+    n_success <- 0
+
+    for (b in seq_len(n_boot)) {
+
+      # Resample full training set with replacement
+      idx_boot   <- sample(seq_len(nrow(train_80)), replace = TRUE)
+      train_boot <- train_80[idx_boot, ]
+
+      # CRITICAL: re-enforce correct factor levels after resampling
+      # Without this resampling resets alphabetical order
+      # which swaps Roadside and RoadsideVeg predictions
+      train_boot$Location_Coarse <- factor(
+        train_boot$Location_Coarse,
+        levels = c("Forest", "Roadside", "RoadsideVeg"))
+      train_boot$Age.Class <- factor(
+        train_boot$Age.Class,
+        levels = levels(train_80$Age.Class))
+      train_boot$Sex <- factor(
+        train_boot$Sex,
+        levels = levels(train_80$Sex))
+      train_boot$Behaviour_Coarse <- factor(
+        train_boot$Behaviour_Coarse,
+        levels = levels(train_80$Behaviour_Coarse))
+
+      # Rebuild model matrix from bootstrap sample
+      X_boot <- tryCatch(
+        model.matrix(
+          ~ (Location_Coarse + Age.Class + Sex +
+             hour_sin + hour_cos)^3,
+          data = train_boot)[, -1],
+        error = function(e) NULL)
+      if (is.null(X_boot)) next
+
+      y_boot <- train_boot$Behaviour_Coarse
+
+      # Refit LASSO on bootstrap sample
+      fit_boot <- tryCatch(
+        cv.glmnet(
+          x      = X_boot,
+          y      = y_boot,
+          family = "multinomial",
+          alpha  = 1,
+          nfolds = 5),
+        error = function(e) NULL)
+      if (is.null(fit_boot)) next
+
+      # Predict on fixed grid
+      grid <- make_time_grid(age, sex, loc)
+      prob <- tryCatch(
+        get_probs(grid,
+                  fit = fit_boot$glmnet.fit,
+                  lam = fit_boot$lambda.min),
+        error = function(e) NULL)
+      if (is.null(prob)) next
+
+      boot_mat[b, , ] <- as.matrix(prob[, beh_levels])
+      n_success <- n_success + 1
+    }
+
+    cat(sprintf("  Bootstrap done: %s %s %s (n=%d, %d/%d ok)\n",
+                age, sex, loc, n_sub, n_success, n_boot))
+
+    # Compute 2.5th and 97.5th percentiles
+    ci_list <- lapply(seq_along(beh_levels), function(k) {
+      vals <- boot_mat[, , k]
+      vals <- vals[complete.cases(vals), , drop = FALSE]
+      data.frame(
+        Hour      = hours_fine,
+        Behaviour = beh_levels[k],
+        Lower     = apply(vals, 2, quantile, 0.025, na.rm = TRUE),
+        Upper     = apply(vals, 2, quantile, 0.975, na.rm = TRUE),
+        Location  = loc)
+    })
+
+    results[[loc]] <- bind_rows(ci_list)
+  }
+
+  bind_rows(results)
+}
+
+# ── Main plot function ────────────────────────────────────────────
+make_fig1_boot <- function(age, sex, fig_label) {
+
+  cat(sprintf("\nBuilding %s (%s %s)...\n", fig_label, age, sex))
+
+  fig_letter <- substr(fig_label, nchar(fig_label), nchar(fig_label))
+
+  # Point estimates
+  point_df <- get_point_estimates(age, sex) |>
+    pivot_longer(cols      = all_of(beh_levels),
+                 names_to  = "Behaviour",
+                 values_to = "Prob") |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Bootstrap CIs
+  ci_df <- boot_ci_time(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Merge CI with point estimates
+  ribbon_df <- ci_df |>
+    left_join(point_df, by = c("Hour", "Behaviour", "Location"))
+
+  # Observed proportions
+  obs_df <- obs_props(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # ── Plot ─────────────────────────────────────────────────────────
+  p <- ggplot() +
+
+    # Lower CI bound dashed line
+    geom_line(
+      data      = ribbon_df,
+      aes(x = Hour, y = Lower, color = Location),
+      linewidth = 0.4,
+      linetype  = "dashed",
+      alpha     = 0.6
+    ) +
+
+    # Upper CI bound dashed line
+    geom_line(
+      data      = ribbon_df,
+      aes(x = Hour, y = Upper, color = Location),
+      linewidth = 0.4,
+      linetype  = "dashed",
+      alpha     = 0.6
+    ) +
+
+    # LASSO point estimate — solid line
+    geom_line(
+      data      = point_df,
+      aes(x = Hour, y = Prob, color = Location),
+      linewidth = 1.1
+    ) +
+
+    # Observed proportion circles
+    geom_point(
+      data   = obs_df,
+      aes(x = Hour, y = prop, color = Location),
+      size   = 2.5,
+      shape  = 21,
+      fill   = "white",
+      stroke = 1.2,
+      alpha  = 0.85
+    ) +
+
+    facet_wrap(~ Behaviour, nrow = 1, scales = "free_y") +
+    scale_color_manual(values = loc_colors, name = "Location") +
+    scale_x_continuous(
+      limits = c(8, 18),
+      breaks = c(8, 10, 12, 14, 16, 18),
+      labels = c("08:00","10:00","12:00",
+                 "14:00","16:00","18:00")
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      expand = expansion(mult = c(0.02, 0.10))
+    ) +
+    labs(
+      title    = sprintf(
+        "Fig. 1%s \u2014 Predicted probability of behaviour across time of day (%s %s)",
+        fig_letter, age, sex),
+      subtitle = paste0(
+        "Age = ", age, " \u00b7 Sex = ", sex,
+        " \u00b7 solid = LASSO prediction",
+        " \u00b7 dashed = bootstrap 95% CI (n=", N_BOOT, ")",
+        " \u00b7 circles = observed proportions (n \u2265 2)"),
+      x       = "Hour of day",
+      y       = "Probability of Behaviour",
+      caption = paste0(
+        "Unweighted LASSO \u00b7 \u03bb = lambda.min",
+        " \u00b7 Green = Forest",
+        " \u00b7 Red = Roadside",
+        " \u00b7 Purple = RoadsideVeg")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+      strip.text       = element_text(size = 10, face = "bold",
+                                      color = "grey15"),
+      strip.background = element_rect(fill = "grey97", color = "grey88"),
+      axis.text.x      = element_text(angle = 30, hjust = 1, size = 8.5),
+      axis.text.y      = element_text(size = 9),
+      legend.position  = "top",
+      legend.title     = element_text(size = 9.5, face = "bold"),
+      legend.text      = element_text(size = 9.5),
+      plot.title       = element_text(size = 11, face = "bold",
+                                      color = "grey10"),
+      plot.subtitle    = element_text(size = 8.5, color = "grey45"),
+      plot.caption     = element_text(size = 7.5, color = "grey55",
+                                      hjust = 0),
+      plot.margin      = unit(c(10, 10, 8, 10), "pt")
+    )
+
+  fname <- sprintf("fig1%s_%s_%s_boot.png",
+                   fig_letter,
+                   tolower(age),
+                   tolower(sex))
+  ggsave(fname, plot = p, width = 15, height = 6,
+         dpi = 300, bg = "white")
+  cat(sprintf("Saved: %s\n", fname))
+  p
+}
+
+# ── Run all 4 figures ─────────────────────────────────────────────
+# Set N_BOOT <- 50 at top for quick test first
+# Then change to 500 for final run
+fig1a_boot <- make_fig1_boot("Adult",    "Female", "fig1a")
+fig1b_boot <- make_fig1_boot("Adult",    "Male",   "fig1b")
+fig1c_boot <- make_fig1_boot("Subadult", "Female", "fig1c")
+fig1d_boot <- make_fig1_boot("Subadult", "Male",   "fig1d")
+
+cat("\nAll Fig 1 bootstrap plots complete.\n")
+
+```
+#BOOTSTRAP PP
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# FIG 2a-2d — Predicted probability across time of day
+# WITH Bootstrap 95% CI — SHADED RIBBON style
+# Hours: 08:00–18:00
+# All 4 Age×Sex combinations
+# Requires: lasso_final_80, train_80, y_train_80
+#
+# SPEED SETTINGS:
+#   Quick test:  N_BOOT <- 50,  NFOLDS_BOOT <- 3
+#   Final run:   N_BOOT <- 500, NFOLDS_BOOT <- 5
+# ══════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+
+margin <- ggplot2::margin
+
+# ── SPEED SETTINGS ────────────────────────────────────────────────
+N_BOOT      <- 50    # change to 500 for final run
+NFOLDS_BOOT <- 3     # change to 5 for final run
+
+set.seed(123)
+
+hours_fine <- seq(8, 18, by = 0.5)
+beh_levels <- levels(y_train_80)
+
+loc_colors <- c(
+  "Forest"      = "#1D9E75",
+  "Roadside"    = "#E24B4A",
+  "RoadsideVeg" = "#7F77DD"
+)
+
+# ── Extract fitted model once ─────────────────────────────────────
+lasso_fit   <- lasso_final_80$glmnet.fit
+best_lambda <- lasso_final_80$lambda.min
+
+# ── Build prediction grid ─────────────────────────────────────────
+make_time_grid <- function(age, sex, loc) {
+  data.frame(
+    Location_Coarse = factor(loc,
+                             levels = c("Forest","Roadside","RoadsideVeg")),
+    Age.Class       = factor(age,  levels = levels(train_80$Age.Class)),
+    Sex             = factor(sex,  levels = levels(train_80$Sex)),
+    hour            = hours_fine,
+    hour_sin        = sin(2 * pi * hours_fine / 24),
+    hour_cos        = cos(2 * pi * hours_fine / 24)
+  )
+}
+
+# ── Get LASSO predicted probabilities ─────────────────────────────
+get_probs <- function(grid, fit = lasso_fit, lam = best_lambda) {
+  X_new <- model.matrix(
+    ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+    data = grid
+  )[, -1]
+  prob <- predict(fit,
+                  newx = X_new,
+                  s    = lam,
+                  type = "response")[,,1]
+  colnames(prob) <- beh_levels
+  df          <- as.data.frame(prob)
+  df$Hour     <- grid$hour
+  df$Location <- as.character(grid$Location_Coarse[1])
+  df
+}
+
+# ── Point estimates for all 3 locations ───────────────────────────
+get_point_estimates <- function(age, sex) {
+  bind_rows(lapply(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    function(loc) get_probs(make_time_grid(age, sex, loc))
+  ))
+}
+
+# ── Observed proportions (circles) ────────────────────────────────
+obs_props <- function(age, sex) {
+  totals <- train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour) |>
+    summarise(n_total = n(), .groups = "drop")
+
+  train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour, Behaviour_Coarse) |>
+    summarise(n_beh = n(), .groups = "drop") |>
+    left_join(totals, by = c("Location_Coarse", "hour")) |>
+    mutate(prop = n_beh / n_total) |>
+    filter(n_total >= 2) |>
+    rename(Behaviour = Behaviour_Coarse,
+           Hour      = hour,
+           Location  = Location_Coarse)
+}
+
+# ── Bootstrap CI ──────────────────────────────────────────────────
+# Refits LASSO on each bootstrap resample of full training data
+# Factor levels re-enforced inside loop — prevents Roadside/RoadsideVeg swap
+# NFOLDS_BOOT controls speed — use 3 for testing, 5 for final
+boot_ci_time <- function(age, sex, n_boot = N_BOOT) {
+
+  locs    <- c("Forest", "Roadside", "RoadsideVeg")
+  results <- list()
+
+  for (loc in locs) {
+
+    sub   <- train_80 |>
+      filter(Age.Class       == age,
+             Sex             == sex,
+             Location_Coarse == loc)
+
+    n_sub <- nrow(sub)
+
+    if (n_sub < 3) {
+      cat(sprintf("  Skipping %s %s %s — n=%d too small\n",
+                  age, sex, loc, n_sub))
+      next
+    }
+
+    n_hours  <- length(hours_fine)
+    boot_mat <- array(NA,
+                      dim      = c(n_boot, n_hours, length(beh_levels)),
+                      dimnames = list(NULL, NULL, beh_levels))
+    n_success <- 0
+
+    for (b in seq_len(n_boot)) {
+
+      # Resample full training set with replacement
+      idx_boot   <- sample(seq_len(nrow(train_80)), replace = TRUE)
+      train_boot <- train_80[idx_boot, ]
+
+      # CRITICAL: re-enforce correct factor levels after resampling
+      # Without this, resampling resets to alphabetical order
+      # which swaps Roadside and RoadsideVeg predictions
+      train_boot$Location_Coarse <- factor(
+        train_boot$Location_Coarse,
+        levels = c("Forest", "Roadside", "RoadsideVeg"))
+      train_boot$Age.Class <- factor(
+        train_boot$Age.Class,
+        levels = levels(train_80$Age.Class))
+      train_boot$Sex <- factor(
+        train_boot$Sex,
+        levels = levels(train_80$Sex))
+      train_boot$Behaviour_Coarse <- factor(
+        train_boot$Behaviour_Coarse,
+        levels = levels(train_80$Behaviour_Coarse))
+
+      # Rebuild model matrix from bootstrap sample
+      X_boot <- tryCatch(
+        model.matrix(
+          ~ (Location_Coarse + Age.Class + Sex +
+               hour_sin + hour_cos)^3,
+          data = train_boot)[, -1],
+        error = function(e) NULL)
+      if (is.null(X_boot)) next
+
+      y_boot <- train_boot$Behaviour_Coarse
+
+      # Refit LASSO — use NFOLDS_BOOT for speed control
+      fit_boot <- tryCatch(
+        cv.glmnet(
+          x      = X_boot,
+          y      = y_boot,
+          family = "multinomial",
+          alpha  = 1,
+          nfolds = NFOLDS_BOOT),   # 3 = faster, 5 = more accurate
+        error = function(e) NULL)
+      if (is.null(fit_boot)) next
+
+      # Predict on fixed grid
+      grid <- make_time_grid(age, sex, loc)
+      prob <- tryCatch(
+        get_probs(grid,
+                  fit = fit_boot$glmnet.fit,
+                  lam = fit_boot$lambda.min),
+        error = function(e) NULL)
+      if (is.null(prob)) next
+
+      boot_mat[b, , ] <- as.matrix(prob[, beh_levels])
+      n_success <- n_success + 1
+
+      # Progress every 10 boots
+      if (b %% 10 == 0) {
+        cat(sprintf("    %s %s %s — boot %d/%d\n",
+                    age, sex, loc, b, n_boot))
+      }
+    }
+
+    cat(sprintf("  Done: %s %s %s (n=%d, %d/%d succeeded)\n",
+                age, sex, loc, n_sub, n_success, n_boot))
+
+    # Compute 2.5th and 97.5th percentiles
+    ci_list <- lapply(seq_along(beh_levels), function(k) {
+      vals <- boot_mat[, , k]
+      vals <- vals[complete.cases(vals), , drop = FALSE]
+      data.frame(
+        Hour      = hours_fine,
+        Behaviour = beh_levels[k],
+        Lower     = apply(vals, 2, quantile, 0.025, na.rm = TRUE),
+        Upper     = apply(vals, 2, quantile, 0.975, na.rm = TRUE),
+        Location  = loc)
+    })
+
+    results[[loc]] <- bind_rows(ci_list)
+  }
+
+  bind_rows(results)
+}
+
+# ── Main plot function ─────────────────────────────────────────────
+make_fig2_boot <- function(age, sex, fig_label) {
+
+  cat(sprintf("\n══════════════════════════════════════\n"))
+  cat(sprintf("Building %s (%s %s)...\n", fig_label, age, sex))
+  cat(sprintf("N_BOOT=%d  NFOLDS=%d\n", N_BOOT, NFOLDS_BOOT))
+  cat(sprintf("══════════════════════════════════════\n"))
+
+  fig_letter <- substr(fig_label, nchar(fig_label), nchar(fig_label))
+
+  # Point estimates
+  point_df <- get_point_estimates(age, sex) |>
+    pivot_longer(cols      = all_of(beh_levels),
+                 names_to  = "Behaviour",
+                 values_to = "Prob") |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Bootstrap CIs
+  ci_df <- boot_ci_time(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Merge CI with point estimates for ribbon
+  ribbon_df <- ci_df |>
+    left_join(point_df, by = c("Hour", "Behaviour", "Location"))
+
+  # Observed proportions
+  obs_df <- obs_props(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # ── Plot ──────────────────────────────────────────────────────────
+  p <- ggplot() +
+
+    # Shaded bootstrap CI ribbon
+    geom_ribbon(
+      data  = ribbon_df,
+      aes(x    = Hour,
+          ymin = Lower,
+          ymax = Upper,
+          fill = Location),
+      alpha = 0.18
+    ) +
+
+    # LASSO point estimate — solid line
+    geom_line(
+      data      = point_df,
+      aes(x = Hour, y = Prob, color = Location),
+      linewidth = 1.1
+    ) +
+
+    # Observed proportion circles
+    geom_point(
+      data   = obs_df,
+      aes(x = Hour, y = prop, color = Location),
+      size   = 2.5,
+      shape  = 21,
+      fill   = "white",
+      stroke = 1.2,
+      alpha  = 0.85
+    ) +
+
+    facet_wrap(~ Behaviour, nrow = 1, scales = "free_y") +
+    scale_color_manual(values = loc_colors, name = "Location") +
+    scale_fill_manual(values  = loc_colors, name = "Location") +
+    scale_x_continuous(
+      limits = c(8, 18),
+      breaks = c(8, 10, 12, 14, 16, 18),
+      labels = c("08:00","10:00","12:00",
+                 "14:00","16:00","18:00")
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      expand = expansion(mult = c(0.02, 0.10))
+    ) +
+    labs(
+      title    = sprintf(
+        "Fig. 2%s \u2014 Predicted probability of behaviour across time of day (%s %s)",
+        fig_letter, age, sex),
+      subtitle = paste0(
+        "Age = ", age, " \u00b7 Sex = ", sex,
+        " \u00b7 solid = LASSO prediction",
+        " \u00b7 shading = bootstrap 95% CI (n=", N_BOOT, ")",
+        " \u00b7 circles = observed proportions (n \u2265 2)"),
+      x       = "Hour of day",
+      y       = "Probability of Behaviour",
+      caption = paste0(
+        "Unweighted LASSO \u00b7 \u03bb = lambda.min",
+        " \u00b7 Green = Forest",
+        " \u00b7 Red = Roadside",
+        " \u00b7 Purple = RoadsideVeg")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+      strip.text       = element_text(size = 10, face = "bold",
+                                      color = "grey15"),
+      strip.background = element_rect(fill = "grey97", color = "grey88"),
+      axis.text.x      = element_text(angle = 30, hjust = 1, size = 8.5),
+      axis.text.y      = element_text(size = 9),
+      legend.position  = "top",
+      legend.title     = element_text(size = 9.5, face = "bold"),
+      legend.text      = element_text(size = 9.5),
+      plot.title       = element_text(size = 11, face = "bold",
+                                      color = "grey10"),
+      plot.subtitle    = element_text(size = 8.5, color = "grey45"),
+      plot.caption     = element_text(size = 7.5, color = "grey55",
+                                      hjust = 0),
+      plot.margin      = unit(c(10, 10, 8, 10), "pt")
+    )
+
+  # Save
+  fname <- sprintf("fig2%s_%s_%s_boot.png",
+                   fig_letter,
+                   tolower(age),
+                   tolower(sex))
+  ggsave(fname, plot = p, width = 15, height = 6,
+         dpi = 300, bg = "white")
+  cat(sprintf("Saved: %s\n", fname))
+  p
+}
+
+# ══════════════════════════════════════════════════════════════════
+# RUN — test one figure first then all four
+# ══════════════════════════════════════════════════════════════════
+
+# ── STEP 1: Test with fig2a first (fastest subgroup) ─────────────
+cat("Running quick test: fig2a (Adult Female)\n")
+cat("N_BOOT =", N_BOOT, "— change to 500 for final run\n\n")
+
+fig2a_boot <- make_fig2_boot("Adult", "Female", "fig2a")
+
+# ── STEP 2: If fig2a looks correct run all four ───────────────────
+# Uncomment after confirming fig2a is correct:
+
+```
+
+```{r}
+
+fig2b_boot <- make_fig2_boot("Adult",    "Male",   "fig2b")
+```
+```{r}
+ fig2c_boot <- make_fig2_boot("Subadult", "Female", "fig2c")
+```
+```{r}
+ fig2d_boot <- make_fig2_boot("Subadult", "Male",   "fig2d")
+
+```
+
+# cat("\nAll Fig 2 bootstrap plots complete.\n")
+# cat("Files saved:\n")
+# cat("  fig2a_adult_female_boot.png\n")
+# cat("  fig2b_adult_male_boot.png\n")
+# cat("  fig2c_subadult_female_boot.png\n")
+# cat("  fig2d_subadult_male_boot.png\n")
+
+
+#Again Bootstrap for axis improvement
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# FIG 1a-1d — Predicted probability across time of day
+# WITH Bootstrap 95% CI — SHADED RIBBON style
+# Hours: 08:00–18:00
+# All 4 Age×Sex combinations
+# Requires: lasso_final_80, train_80, y_train_80
+#
+# SPEED SETTINGS:
+#   Quick test:  N_BOOT <- 50,  NFOLDS_BOOT <- 3
+#   Final run:   N_BOOT <- 500, NFOLDS_BOOT <- 5
+# ══════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+
+margin <- ggplot2::margin
+
+# ── SPEED SETTINGS ────────────────────────────────────────────────
+N_BOOT      <- 50    # change to 500 for final run
+NFOLDS_BOOT <- 3     # change to 5 for final run
+
+set.seed(123)
+
+hours_fine <- seq(8, 18, by = 0.5)
+beh_levels <- levels(y_train_80)
+
+loc_colors <- c(
+  "Forest"      = "#1D9E75",
+  "Roadside"    = "#E24B4A",
+  "RoadsideVeg" = "#7F77DD"
+)
+
+# ── Extract fitted model once ─────────────────────────────────────
+lasso_fit   <- lasso_final_80$glmnet.fit
+best_lambda <- lasso_final_80$lambda.min
+
+# ── Build prediction grid ─────────────────────────────────────────
+make_time_grid <- function(age, sex, loc) {
+  data.frame(
+    Location_Coarse = factor(loc,
+                             levels = c("Forest","Roadside","RoadsideVeg")),
+    Age.Class       = factor(age,  levels = levels(train_80$Age.Class)),
+    Sex             = factor(sex,  levels = levels(train_80$Sex)),
+    hour            = hours_fine,
+    hour_sin        = sin(2 * pi * hours_fine / 24),
+    hour_cos        = cos(2 * pi * hours_fine / 24)
+  )
+}
+
+# ── Get LASSO predicted probabilities ─────────────────────────────
+get_probs <- function(grid, fit = lasso_fit, lam = best_lambda) {
+  X_new <- model.matrix(
+    ~ (Location_Coarse + Age.Class + Sex + hour_sin + hour_cos)^3,
+    data = grid
+  )[, -1]
+  prob <- predict(fit,
+                  newx = X_new,
+                  s    = lam,
+                  type = "response")[,,1]
+  colnames(prob) <- beh_levels
+  df          <- as.data.frame(prob)
+  df$Hour     <- grid$hour
+  df$Location <- as.character(grid$Location_Coarse[1])
+  df
+}
+
+# ── Point estimates for all 3 locations ───────────────────────────
+get_point_estimates <- function(age, sex) {
+  bind_rows(lapply(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    function(loc) get_probs(make_time_grid(age, sex, loc))
+  ))
+}
+
+# ── Observed proportions (circles) ────────────────────────────────
+obs_props <- function(age, sex) {
+  totals <- train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour) |>
+    summarise(n_total = n(), .groups = "drop")
+
+  train_80 |>
+    filter(Age.Class == age, Sex == sex,
+           hour >= 8, hour <= 18) |>
+    group_by(Location_Coarse, hour, Behaviour_Coarse) |>
+    summarise(n_beh = n(), .groups = "drop") |>
+    left_join(totals, by = c("Location_Coarse", "hour")) |>
+    mutate(prop = n_beh / n_total) |>
+    filter(n_total >= 2) |>
+    rename(Behaviour = Behaviour_Coarse,
+           Hour      = hour,
+           Location  = Location_Coarse)
+}
+
+# ── Bootstrap CI ──────────────────────────────────────────────────
+# Refits LASSO on each bootstrap resample of full training data
+# Factor levels re-enforced inside loop — prevents Roadside/RoadsideVeg swap
+# NFOLDS_BOOT controls speed — use 3 for testing, 5 for final
+boot_ci_time <- function(age, sex, n_boot = N_BOOT) {
+
+  locs    <- c("Forest", "Roadside", "RoadsideVeg")
+  results <- list()
+
+  for (loc in locs) {
+
+    sub   <- train_80 |>
+      filter(Age.Class       == age,
+             Sex             == sex,
+             Location_Coarse == loc)
+
+    n_sub <- nrow(sub)
+
+    if (n_sub < 3) {
+      cat(sprintf("  Skipping %s %s %s — n=%d too small\n",
+                  age, sex, loc, n_sub))
+      next
+    }
+
+    n_hours  <- length(hours_fine)
+    boot_mat <- array(NA,
+                      dim      = c(n_boot, n_hours, length(beh_levels)),
+                      dimnames = list(NULL, NULL, beh_levels))
+    n_success <- 0
+
+    for (b in seq_len(n_boot)) {
+
+      # Resample full training set with replacement
+      idx_boot   <- sample(seq_len(nrow(train_80)), replace = TRUE)
+      train_boot <- train_80[idx_boot, ]
+
+      # CRITICAL: re-enforce correct factor levels after resampling
+      # Without this, resampling resets to alphabetical order
+      # which swaps Roadside and RoadsideVeg predictions
+      train_boot$Location_Coarse <- factor(
+        train_boot$Location_Coarse,
+        levels = c("Forest", "Roadside", "RoadsideVeg"))
+      train_boot$Age.Class <- factor(
+        train_boot$Age.Class,
+        levels = levels(train_80$Age.Class))
+      train_boot$Sex <- factor(
+        train_boot$Sex,
+        levels = levels(train_80$Sex))
+      train_boot$Behaviour_Coarse <- factor(
+        train_boot$Behaviour_Coarse,
+        levels = levels(train_80$Behaviour_Coarse))
+
+      # Rebuild model matrix from bootstrap sample
+      X_boot <- tryCatch(
+        model.matrix(
+          ~ (Location_Coarse + Age.Class + Sex +
+               hour_sin + hour_cos)^3,
+          data = train_boot)[, -1],
+        error = function(e) NULL)
+      if (is.null(X_boot)) next
+
+      y_boot <- train_boot$Behaviour_Coarse
+
+      # Refit LASSO — use NFOLDS_BOOT for speed control
+      fit_boot <- tryCatch(
+        cv.glmnet(
+          x      = X_boot,
+          y      = y_boot,
+          family = "multinomial",
+          alpha  = 1,
+          nfolds = NFOLDS_BOOT),   # 3 = faster, 5 = more accurate
+        error = function(e) NULL)
+      if (is.null(fit_boot)) next
+
+      # Predict on fixed grid
+      grid <- make_time_grid(age, sex, loc)
+      prob <- tryCatch(
+        get_probs(grid,
+                  fit = fit_boot$glmnet.fit,
+                  lam = fit_boot$lambda.min),
+        error = function(e) NULL)
+      if (is.null(prob)) next
+
+      boot_mat[b, , ] <- as.matrix(prob[, beh_levels])
+      n_success <- n_success + 1
+
+      # Progress every 10 boots
+      if (b %% 10 == 0) {
+        cat(sprintf("    %s %s %s — boot %d/%d\n",
+                    age, sex, loc, b, n_boot))
+      }
+    }
+
+    cat(sprintf("  Done: %s %s %s (n=%d, %d/%d succeeded)\n",
+                age, sex, loc, n_sub, n_success, n_boot))
+
+    # Compute 2.5th and 97.5th percentiles
+    ci_list <- lapply(seq_along(beh_levels), function(k) {
+      vals <- boot_mat[, , k]
+      vals <- vals[complete.cases(vals), , drop = FALSE]
+      data.frame(
+        Hour      = hours_fine,
+        Behaviour = beh_levels[k],
+        Lower     = apply(vals, 2, quantile, 0.025, na.rm = TRUE),
+        Upper     = apply(vals, 2, quantile, 0.975, na.rm = TRUE),
+        Location  = loc)
+    })
+
+    results[[loc]] <- bind_rows(ci_list)
+  }
+
+  bind_rows(results)
+}
+
+# ── Main plot function ─────────────────────────────────────────────
+make_fig1_boot <- function(age, sex, fig_label) {
+
+  cat(sprintf("\n══════════════════════════════════════\n"))
+  cat(sprintf("Building %s (%s %s)...\n", fig_label, age, sex))
+  cat(sprintf("N_BOOT=%d  NFOLDS=%d\n", N_BOOT, NFOLDS_BOOT))
+  cat(sprintf("══════════════════════════════════════\n"))
+
+  fig_letter <- substr(fig_label, nchar(fig_label), nchar(fig_label))
+
+  # Point estimates
+  point_df <- get_point_estimates(age, sex) |>
+    pivot_longer(cols      = all_of(beh_levels),
+                 names_to  = "Behaviour",
+                 values_to = "Prob") |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Bootstrap CIs
+  ci_df <- boot_ci_time(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # Merge CI with point estimates for ribbon
+  ribbon_df <- ci_df |>
+    left_join(point_df, by = c("Hour", "Behaviour", "Location"))
+
+  # Observed proportions
+  obs_df <- obs_props(age, sex) |>
+    mutate(
+      Behaviour = factor(Behaviour, levels = beh_levels),
+      Location  = factor(Location,
+                         levels = c("Forest","Roadside","RoadsideVeg"))
+    )
+
+  # ── Plot ──────────────────────────────────────────────────────────
+  p <- ggplot() +
+
+    # Shaded bootstrap CI ribbon
+    geom_ribbon(
+      data  = ribbon_df,
+      aes(x    = Hour,
+          ymin = Lower,
+          ymax = Upper,
+          fill = Location),
+      alpha = 0.18
+    ) +
+
+    # LASSO point estimate — solid line
+    geom_line(
+      data      = point_df,
+      aes(x = Hour, y = Prob, color = Location),
+      linewidth = 1.1
+    ) +
+
+    # Observed proportion circles
+    geom_point(
+      data   = obs_df,
+      aes(x = Hour, y = prop, color = Location),
+      size   = 2.5,
+      shape  = 21,
+      fill   = "white",
+      stroke = 1.2,
+      alpha  = 0.85
+    ) +
+
+    # CHANGED: removed scales = "free_y" so all panels share one fixed scale
+    facet_wrap(~ Behaviour, nrow = 1) +
+    scale_color_manual(values = loc_colors, name = "Location") +
+    scale_fill_manual(values  = loc_colors, name = "Location") +
+    scale_x_continuous(
+      limits = c(8, 18),
+      breaks = c(8, 10, 12, 14, 16, 18),
+      labels = c("08:00","10:00","12:00",
+                 "14:00","16:00","18:00")
+    ) +
+    # CHANGED: fixed 0–100% range so every panel & every figure is comparable
+    scale_y_continuous(
+      limits = c(0, 1),
+      labels = scales::percent_format(accuracy = 1),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    labs(
+      title    = sprintf(
+        "Fig. 1%s \u2014 Predicted probability of behaviour across time of day (%s %s)",
+        fig_letter, age, sex),
+      subtitle = paste0(
+        "Age = ", age, " \u00b7 Sex = ", sex,
+        " \u00b7 solid = LASSO prediction",
+        " \u00b7 shading = bootstrap 95% CI (n=", N_BOOT, ")",
+        " \u00b7 circles = observed proportions (n \u2265 2)"),
+      x       = "Hour of day",
+      y       = "Probability of Behaviour",
+      caption = paste0(
+        "Unweighted LASSO \u00b7 \u03bb = lambda.min",
+        " \u00b7 Green = Forest",
+        " \u00b7 Red = Roadside",
+        " \u00b7 Purple = RoadsideVeg")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+      strip.text       = element_text(size = 10, face = "bold",
+                                      color = "grey15"),
+      strip.background = element_rect(fill = "grey97", color = "grey88"),
+      axis.text.x      = element_text(angle = 30, hjust = 1, size = 8.5),
+      axis.text.y      = element_text(size = 9),
+      legend.position  = "top",
+      legend.title     = element_text(size = 9.5, face = "bold"),
+      legend.text      = element_text(size = 9.5),
+      plot.title       = element_text(size = 11, face = "bold",
+                                      color = "grey10"),
+      plot.subtitle    = element_text(size = 8.5, color = "grey45"),
+      plot.caption     = element_text(size = 7.5, color = "grey55",
+                                      hjust = 0),
+      plot.margin      = unit(c(10, 10, 8, 10), "pt")
+    )
+
+  # Save
+  fname <- sprintf("fig1%s_%s_%s_boot.png",
+                   fig_letter,
+                   tolower(age),
+                   tolower(sex))
+  ggsave(fname, plot = p, width = 15, height = 6,
+         dpi = 300, bg = "white")
+  cat(sprintf("Saved: %s\n", fname))
+  p
+}
+
+# ══════════════════════════════════════════════════════════════════
+# RUN — test one figure first then all four
+# ══════════════════════════════════════════════════════════════════
+
+# ── STEP 1: Test with fig1a first (fastest subgroup) ─────────────
+cat("Running quick test: fig1a (Adult Female)\n")
+cat("N_BOOT =", N_BOOT, "— change to 500 for final run\n\n")
+
+fig1a_boot <- make_fig1_boot("Adult", "Female", "fig1a")
+
+```
+
+```{r}
+# ── STEP 2: If fig1a looks correct run all four ───────────────────
+# Uncomment after confirming fig1a is correct:
+
+fig1b_boot <- make_fig1_boot("Adult",    "Male",   "fig1b")
+
+```
+
+```{r}
+fig1c_boot <- make_fig1_boot("Subadult", "Female", "fig1c")
+
+```
+
+```{r}
+fig1d_boot <- make_fig1_boot("Subadult", "Male",   "fig1d")
+
+```
+
+# cat("\nAll Fig 1 bootstrap plots complete.\n")
+# cat("Files saved:\n")
+# cat("  fig1a_adult_female_boot.png\n")
+# cat("  fig1b_adult_male_boot.png\n")
+# cat("  fig1c_subadult_female_boot.png\n")
+# cat("  fig1d_subadult_male_boot.png\n")
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# BOOTSTRAP PREDICTIONS — GROUPED BAR CHART WITH 95% CI ERROR BARS
+# ══════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(dplyr)
+
+# Load data
+df <- read.csv("fig2_bootstrap_predictions.csv")
+
+# Clean up factor levels
+df$Location <- factor(df$Location, levels = c("Forest", "Roadside", "RoadsideVeg"))
+df$Behaviour <- factor(df$Behaviour, levels = c("Rest", "Feed/Forage", 
+                                                  "Human Directed", "Move", 
+                                                  "Socio-Sexual"))
+df$Combination <- factor(df$Combination, 
+                         levels = c("Adult Female", "Adult Male", 
+                                    "Subadult Female", "Subadult Male"))
+
+# Convert to percentage
+df <- df %>%
+  mutate(
+    Mean_pct    = Mean     * 100,
+    Lower_pct   = Lower95  * 100,
+    Upper_pct   = Upper95  * 100
+  )
+
+# Colour palette matching your existing figures
+loc_colours <- c(
+  "Forest"      = "#2ecc71",
+  "Roadside"    = "#e74c3c",
+  "RoadsideVeg" = "#9b59b6"
+)
+
+# ── PLOT: all behaviours × all groups ─────────────────────────────
+p <- ggplot(df, aes(x = Location, y = Mean_pct, fill = Location)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_errorbar(
+    aes(ymin = Lower_pct, ymax = Upper_pct),
+    width = 0.25,
+    linewidth = 0.6,
+    colour = "grey30"
+  ) +
+  facet_grid(Combination ~ Behaviour) +
+  scale_fill_manual(values = loc_colours) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.1))
+  ) +
+  labs(
+    title   = "Predicted probability of behaviour by location and demographic group",
+    subtitle = "Bootstrap mean ± 95% CI · LASSO (λ = λ.min)",
+    x       = NULL,
+    y       = "Probability of Behaviour (%)",
+    fill    = "Location",
+    caption = "Rows = Age × Sex group · Columns = Behaviour category"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background   = element_rect(fill = "grey92", colour = "grey70"),
+    strip.text         = element_text(face = "bold", size = 9),
+    axis.text.x        = element_blank(),
+    axis.ticks.x       = element_blank(),
+    legend.position    = "top",
+    legend.title       = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", size = 12),
+    plot.subtitle      = element_text(size = 9, colour = "grey40"),
+    plot.caption       = element_text(size = 8, colour = "grey50")
+  )
+
+print(p)
+
+# Save
+ggsave("fig3_bootstrap_bar_chart.png", plot = p,
+       width = 14, height = 10, dpi = 300)
+cat("Saved: fig3_bootstrap_bar_chart.png\n")
+
+# ── PLOT 2: Human Directed only — cleaner focus ────────────────────
+hd_only <- df %>% filter(Behaviour == "Human Directed")
+
+p_hd <- ggplot(hd_only, aes(x = Combination, y = Mean_pct, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.75),
+           width = 0.65) +
+  geom_errorbar(
+    aes(ymin = Lower_pct, ymax = Upper_pct),
+    position = position_dodge(width = 0.75),
+    width = 0.25,
+    linewidth = 0.6,
+    colour = "grey30"
+  ) +
+  geom_text(
+    aes(label = paste0(round(Mean_pct, 1), "%"), y = Upper_pct + 1),
+    position = position_dodge(width = 0.75),
+    size = 3, vjust = 0
+  ) +
+  scale_fill_manual(values = loc_colours) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title    = "Predicted Human Directed probability by location and demographic group",
+    subtitle = "Bootstrap mean ± 95% CI · Unweighted LASSO (λ = λ.min)",
+    x        = "Age × Sex Group",
+    y        = "Probability of Human Directed Behaviour (%)",
+    fill     = "Location"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position    = "top",
+    legend.title       = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", size = 12),
+    plot.subtitle      = element_text(size = 9, colour = "grey40")
+  )
+
+print(p_hd)
+
+ggsave("fig3b_HD_bootstrap_bar.png", plot = p_hd,
+       width = 10, height = 6, dpi = 300)
+cat("Saved: fig3b_HD_bootstrap_bar.png\n")
+```
+
+#K=2 (only)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# REFIT LASSO — k=2 ONLY (no k=1)
+# hour_sin2 and hour_cos2 only — no hour_sin or hour_cos
+# ══════════════════════════════════════════════════════════════════
+
+# ── STEP 1: Add second harmonic ───────────────────────────────────
+train_80$hour_sin2 <- sin(4 * pi * train_80$hour / 24)
+train_80$hour_cos2 <- cos(4 * pi * train_80$hour / 24)
+
+test_20$hour_sin2  <- sin(4 * pi * test_20$hour / 24)
+test_20$hour_cos2  <- cos(4 * pi * test_20$hour / 24)
+```
+
+```{r}
+
+# ── STEP 2: Build model matrix — k=2 only ────────────────────────
+X_train_k2only <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin2 + hour_cos2)^3,
+  data = train_80
+)[, -1]
+
+X_test_k2only <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin2 + hour_cos2)^3,
+  data = test_20
+)[, -1]
+
+cat("Model matrix dimensions (k=2 only):\n")
+cat("Train:", nrow(X_train_k2only), "x", ncol(X_train_k2only), "\n")
+cat("Test: ", nrow(X_test_k2only),  "x", ncol(X_test_k2only),  "\n\n")
+```
+
+```{r}
+
+# ── STEP 3: Refit LASSO ───────────────────────────────────────────
+set.seed(123)
+lasso_k2only <- cv.glmnet(
+  x      = X_train_k2only,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 1,
+  nfolds = 10
+)
+
+cat("LASSO k=2 only fitted.\n")
+cat("lambda.min =", lasso_k2only$lambda.min, "\n\n")
+```
+
+```{r}
+
+# ── STEP 4: Test set predictions ─────────────────────────────────
+prob_k2only_test <- predict(lasso_k2only,
+                             newx = X_test_k2only,
+                             s    = "lambda.min",
+                             type = "response")[,,1]
+colnames(prob_k2only_test) <- levels(y_test_20)
+
+pred_k2only_test <- predict(lasso_k2only,
+                             newx = X_test_k2only,
+                             s    = "lambda.min",
+                             type = "class")[, 1]
+
+y_onehot_test <- model.matrix(
+  ~ y_test_20 - 1,
+  data = data.frame(y_test_20 = y_test_20))
+colnames(y_onehot_test) <- levels(y_test_20)
+```
+
+```{r}
+
+# ── STEP 5: Compare k=1 vs k=2 only ──────────────────────────────
+loss_k1     <- compute_01_loss(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "class")[,1],
+  y_test_20)
+loss_k2only <- compute_01_loss(pred_k2only_test, y_test_20)
+
+ll_k1     <- compute_logloss(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "response")[,,1],
+  y_onehot_test)
+ll_k2only <- compute_logloss(prob_k2only_test, y_onehot_test)
+
+br_k1     <- compute_brier(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "response")[,,1],
+  y_onehot_test)
+br_k2only <- compute_brier(prob_k2only_test, y_onehot_test)
+
+cat("══════════════════════════════════════════\n")
+cat("LASSO k=1 vs k=2 only — Test Set\n")
+cat("══════════════════════════════════════════\n\n")
+cat(sprintf("%-15s  %8s  %10s\n", "Metric", "k=1", "k=2 only"))
+cat(strrep("─", 38), "\n")
+cat(sprintf("%-15s  %8.4f  %10.4f\n", "0-1 Loss ↓",  loss_k1, loss_k2only))
+cat(sprintf("%-15s  %8.4f  %10.4f\n", "Log-Loss ↓",  ll_k1,   ll_k2only))
+cat(sprintf("%-15s  %8.4f  %10.4f\n", "Brier ↓",     br_k1,   br_k2only))
+cat(strrep("─", 38), "\n\n")
+```
+
+```{r}
+
+# ── STEP 6: HD sanity check ───────────────────────────────────────
+hour_fixed <- 8
+test_locs <- data.frame(
+  Location_Coarse = factor(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    levels = c("Forest", "Roadside", "RoadsideVeg")),
+  Age.Class  = factor("Adult",  levels = levels(train_80$Age.Class)),
+  Sex        = factor("Female", levels = levels(train_80$Sex)),
+  hour       = hour_fixed,
+  hour_sin2  = sin(4 * pi * hour_fixed / 24),
+  hour_cos2  = cos(4 * pi * hour_fixed / 24)
+)
+
+X_check <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin2 + hour_cos2)^3,
+  data = test_locs
+)[, -1]
+
+prob_check <- predict(lasso_k2only,
+                      newx = X_check,
+                      s    = "lambda.min",
+                      type = "response")[,,1]
+colnames(prob_check) <- levels(y_train_80)
+rownames(prob_check) <- c("Forest", "Roadside", "RoadsideVeg")
+
+cat("HD probabilities k=2 only (Roadside must be highest):\n")
+print(round(prob_check[, "Human Directed", drop = FALSE], 3))
+```
+#(K=2+k=1) (circular time change)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════
+# REFIT LASSO — k=2 Fourier harmonics (unweighted)
+# Adds second harmonic to capture bimodal daily patterns
+# ══════════════════════════════════════════════════════════════════
+
+# ── STEP 1: Add second harmonic to train and test ─────────────────
+train_80$hour_sin2 <- sin(4 * pi * train_80$hour / 24)
+train_80$hour_cos2 <- cos(4 * pi * train_80$hour / 24)
+
+test_20$hour_sin2  <- sin(4 * pi * test_20$hour / 24)
+test_20$hour_cos2  <- cos(4 * pi * test_20$hour / 24)
+
+cat("Second harmonic added to train and test.\n\n")
+```
+
+
+```{r}
+
+# ── STEP 2: Rebuild model matrix with k=2 ────────────────────────
+X_train_80_k2 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin + hour_cos +
+     hour_sin2 + hour_cos2)^3,
+  data = train_80
+)[, -1]
+
+X_test_20_k2 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin + hour_cos +
+     hour_sin2 + hour_cos2)^3,
+  data = test_20
+)[, -1]
+
+cat("Model matrix dimensions (k=2):\n")
+cat("Train:", nrow(X_train_80_k2), "x", ncol(X_train_80_k2), "\n")
+cat("Test: ", nrow(X_test_20_k2),  "x", ncol(X_test_20_k2),  "\n\n")
+```
+
+```{r}
+
+# ── STEP 3: Refit LASSO on k=2 matrix ────────────────────────────
+set.seed(123)
+lasso_k2 <- cv.glmnet(
+  x      = X_train_80_k2,
+  y      = y_train_80,
+  family = "multinomial",
+  alpha  = 1,
+  nfolds = 10
+)
+
+cat("LASSO k=2 fitted.\n")
+cat("lambda.min =", lasso_k2$lambda.min, "\n")
+cat("lambda.1se =", lasso_k2$lambda.1se, "\n\n")
+```
+
+```{r}
+
+# ── STEP 4: Evaluate on test set ─────────────────────────────────
+prob_lasso_k2_test <- predict(lasso_k2,
+                               newx = X_test_20_k2,
+                               s    = "lambda.min",
+                               type = "response")[,,1]
+colnames(prob_lasso_k2_test) <- levels(y_test_20)
+
+pred_lasso_k2_test <- predict(lasso_k2,
+                               newx = X_test_20_k2,
+                               s    = "lambda.min",
+                               type = "class")[, 1]
+
+y_onehot_test_k2 <- model.matrix(
+  ~ y_test_20 - 1,
+  data = data.frame(y_test_20 = y_test_20))
+colnames(y_onehot_test_k2) <- levels(y_test_20)
+```
+
+```{r}
+
+# ── STEP 5: Compare k=1 vs k=2 metrics ───────────────────────────
+loss_k1 <- compute_01_loss(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "class")[,1],
+  y_test_20)
+
+loss_k2 <- compute_01_loss(pred_lasso_k2_test, y_test_20)
+
+ll_k1 <- compute_logloss(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "response")[,,1],
+  y_onehot_test_k2)
+
+ll_k2 <- compute_logloss(prob_lasso_k2_test, y_onehot_test_k2)
+
+br_k1 <- compute_brier(
+  predict(lasso_final_80, newx = X_test_20,
+          s = "lambda.min", type = "response")[,,1],
+  y_onehot_test_k2)
+
+br_k2 <- compute_brier(prob_lasso_k2_test, y_onehot_test_k2)
+
+cat("══════════════════════════════════════════\n")
+cat("LASSO k=1 vs k=2 — Test Set Comparison\n")
+cat("══════════════════════════════════════════\n\n")
+cat(sprintf("%-15s  %8s  %10s\n", "Metric", "k=1", "k=1+k=2"))
+cat(strrep("─", 35), "\n")
+cat(sprintf("%-15s  %8.4f  %8.4f\n", "0-1 Loss ↓",  loss_k1, loss_k2))
+cat(sprintf("%-15s  %8.4f  %8.4f\n", "Log-Loss ↓",  ll_k1,   ll_k2))
+cat(sprintf("%-15s  %8.4f  %8.4f\n", "Brier ↓",     br_k1,   br_k2))
+cat(strrep("─", 35), "\n\n")
+
+```
+
+```{r}
+
+# ── STEP 6: Sanity check — HD probabilities ───────────────────────
+hour_fixed <- 8
+test_locs_k2 <- data.frame(
+  Location_Coarse = factor(
+    c("Forest", "Roadside", "RoadsideVeg"),
+    levels = c("Forest", "Roadside", "RoadsideVeg")),
+  Age.Class  = factor("Adult",  levels = levels(train_80$Age.Class)),
+  Sex        = factor("Female", levels = levels(train_80$Sex)),
+  hour       = hour_fixed,
+  hour_sin   = sin(2 * pi * hour_fixed / 24),
+  hour_cos   = cos(2 * pi * hour_fixed / 24),
+  hour_sin2  = sin(4 * pi * hour_fixed / 24),
+  hour_cos2  = cos(4 * pi * hour_fixed / 24)
+)
+
+X_check_k2 <- model.matrix(
+  ~ (Location_Coarse + Age.Class + Sex +
+     hour_sin + hour_cos +
+     hour_sin2 + hour_cos2)^3,
+  data = test_locs_k2
+)[, -1]
+
+prob_check_k2 <- predict(lasso_k2,
+                          newx = X_check_k2,
+                          s    = "lambda.min",
+                          type = "response")[,,1]
+colnames(prob_check_k2) <- levels(y_train_80)
+rownames(prob_check_k2) <- c("Forest", "Roadside", "RoadsideVeg")
+
+cat("HD probabilities k=2 (Roadside must be highest):\n")
+print(round(prob_check_k2[, "Human Directed", drop = FALSE], 3))
+
+```
+
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+```{r}
+```

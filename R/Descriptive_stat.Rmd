@@ -1,0 +1,544 @@
+---
+title: "Untitled"
+author: "Salma"
+date: "2026-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r }
+
+load("/Users/salma/Library/CloudStorage/OneDrive-UniversityofArizona/Desktop/Thesis_grad/scan_MNLR.RData")
+head(scan)
+
+```
+
+
+
+```{r }
+# ══════════════════════════════════════════════════════════════════
+# DESCRIPTIVE STATISTICS
+# Macaque Behavioural Scan Sampling Data
+# Requires: train_80, test_20, scan (full dataset)
+# ══════════════════════════════════════════════════════════════════
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ── 1. OVERALL SAMPLE SIZE ───────────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("1. OVERALL SAMPLE SIZE\n")
+cat("══════════════════════════════════════════════\n\n")
+
+cat(sprintf("Full dataset:    N = %d\n", nrow(scan)))
+cat(sprintf("Training set:    N = %d (%.0f%%)\n",
+            nrow(train_80), nrow(train_80)/nrow(scan)*100))
+cat(sprintf("Test set:        N = %d (%.0f%%)\n\n",
+            nrow(test_20),  nrow(test_20)/nrow(scan)*100))
+
+```
+
+```{r}
+
+# ── 2. BEHAVIOURAL FREQUENCY DISTRIBUTION ───────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("2. BEHAVIOURAL FREQUENCY DISTRIBUTION\n")
+cat("══════════════════════════════════════════════\n\n")
+
+beh_freq <- scan |>
+  group_by(Behaviour_Coarse) |>
+  summarise(
+    N       = n(),
+    Pct     = round(n() / nrow(scan) * 100, 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(N))
+
+cat(sprintf("%-20s  %6s  %6s\n", "Behaviour", "N", "%"))
+cat(strrep("-", 36), "\n")
+for (i in 1:nrow(beh_freq)) {
+  cat(sprintf("%-20s  %6d  %5.1f%%\n",
+              beh_freq$Behaviour_Coarse[i],
+              beh_freq$N[i],
+              beh_freq$Pct[i]))
+}
+cat(strrep("-", 36), "\n")
+cat(sprintf("%-20s  %6d  %5.1f%%\n\n", "Total", nrow(scan), 100.0))
+
+```
+
+```{r}
+
+# ── 3. LOCATION DISTRIBUTION ─────────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("3. LOCATION DISTRIBUTION\n")
+cat("══════════════════════════════════════════════\n\n")
+
+loc_freq <- scan |>
+  group_by(Location_Coarse) |>
+  summarise(
+    N   = n(),
+    Pct = round(n() / nrow(scan) * 100, 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(N))
+
+cat(sprintf("%-15s  %6s  %6s\n", "Location", "N", "%"))
+cat(strrep("-", 30), "\n")
+for (i in 1:nrow(loc_freq)) {
+  cat(sprintf("%-15s  %6d  %5.1f%%\n",
+              loc_freq$Location_Coarse[i],
+              loc_freq$N[i],
+              loc_freq$Pct[i]))
+}
+cat(strrep("-", 30), "\n")
+cat(sprintf("%-15s  %6d  %5.1f%%\n\n", "Total", nrow(scan), 100.0))
+
+```
+
+```{r}
+
+# ── 4. AGE AND SEX DISTRIBUTION ──────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("4. AGE AND SEX DISTRIBUTION\n")
+cat("══════════════════════════════════════════════\n\n")
+
+age_freq <- scan |>
+  group_by(Age.Class) |>
+  summarise(N = n(),
+            Pct = round(n()/nrow(scan)*100, 1),
+            .groups = "drop")
+
+sex_freq <- scan |>
+  group_by(Sex) |>
+  summarise(N = n(),
+            Pct = round(n()/nrow(scan)*100, 1),
+            .groups = "drop")
+
+cat("Age Class:\n")
+for (i in 1:nrow(age_freq)) {
+  cat(sprintf("  %-12s  N=%d  (%.1f%%)\n",
+              age_freq$Age.Class[i],
+              age_freq$N[i],
+              age_freq$Pct[i]))
+}
+
+cat("\nSex:\n")
+for (i in 1:nrow(sex_freq)) {
+  cat(sprintf("  %-12s  N=%d  (%.1f%%)\n",
+              sex_freq$Sex[i],
+              sex_freq$N[i],
+              sex_freq$Pct[i]))
+}
+cat("\n")
+```
+
+```{r}
+
+# ── 5. SUBGROUP SAMPLE SIZES (Location x Age x Sex) ──────────────
+cat("══════════════════════════════════════════════\n")
+cat("5. SUBGROUP SAMPLE SIZES\n")
+cat("   (Location x Age x Sex)\n")
+cat("══════════════════════════════════════════════\n\n")
+
+subgroup <- train_80 |>
+  group_by(Location_Coarse, Age.Class, Sex) |>
+  summarise(
+    N_total = n(),
+    N_HD    = sum(Behaviour_Coarse == "Human Directed"),
+    Pct_HD  = round(sum(Behaviour_Coarse == "Human Directed") / n() * 100, 1),
+    .groups = "drop"
+  ) |>
+  arrange(Location_Coarse, Age.Class, Sex)
+
+cat(sprintf("%-14s  %-10s  %-8s  %7s  %6s  %7s\n",
+            "Location", "Age", "Sex",
+            "N_total", "N_HD", "% HD"))
+cat(strrep("-", 58), "\n")
+for (i in 1:nrow(subgroup)) {
+  cat(sprintf("%-14s  %-10s  %-8s  %7d  %6d  %6.1f%%\n",
+              subgroup$Location_Coarse[i],
+              subgroup$Age.Class[i],
+              subgroup$Sex[i],
+              subgroup$N_total[i],
+              subgroup$N_HD[i],
+              subgroup$Pct_HD[i]))
+}
+cat(strrep("-", 58), "\n\n")
+
+# Flag sparse subgroups
+sparse <- subgroup |> filter(N_total < 20)
+if (nrow(sparse) > 0) {
+  cat("Sparse subgroups (N < 20):\n")
+  for (i in 1:nrow(sparse)) {
+    cat(sprintf("  %s %s %s: N=%d\n",
+                sparse$Location_Coarse[i],
+                sparse$Age.Class[i],
+                sparse$Sex[i],
+                sparse$N_total[i]))
+  }
+  cat("\n")
+}
+```
+
+```{r}
+
+# ── 6. BEHAVIOUR BY LOCATION ─────────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("6. BEHAVIOUR BY LOCATION\n")
+cat("══════════════════════════════════════════════\n\n")
+
+beh_by_loc <- scan |>
+  group_by(Location_Coarse, Behaviour_Coarse) |>
+  summarise(N = n(), .groups = "drop") |>
+  group_by(Location_Coarse) |>
+  mutate(Pct = round(N / sum(N) * 100, 1)) |>
+  ungroup() |>
+  pivot_wider(names_from  = Location_Coarse,
+              values_from = c(N, Pct),
+              values_fill = 0)
+
+cat("Percentage of each behaviour by location:\n\n")
+
+beh_loc_pct <- scan |>
+  group_by(Location_Coarse, Behaviour_Coarse) |>
+  summarise(N = n(), .groups = "drop") |>
+  group_by(Location_Coarse) |>
+  mutate(Pct = round(N / sum(N) * 100, 1)) |>
+  ungroup()
+
+# Print as wide table
+locs <- c("Forest", "Roadside", "RoadsideVeg")
+behs <- c("Rest", "Move", "Feed/Forage",
+          "Socio-Sexual", "Human Directed")
+
+cat(sprintf("%-18s", "Behaviour"))
+for (l in locs) cat(sprintf("  %12s", l))
+cat("\n")
+cat(strrep("-", 18 + 14 * length(locs)), "\n")
+
+for (b in behs) {
+  cat(sprintf("%-18s", b))
+  for (l in locs) {
+    val <- beh_loc_pct |>
+      filter(Location_Coarse == l,
+             Behaviour_Coarse == b) |>
+      pull(Pct)
+    val <- ifelse(length(val) == 0, 0, val)
+    cat(sprintf("  %11.1f%%", val))
+  }
+  cat("\n")
+}
+cat("\n")
+
+```
+
+```{r}
+
+# ── 7. BEHAVIOUR BY AGE AND SEX ──────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("7. BEHAVIOUR BY AGE AND SEX\n")
+cat("══════════════════════════════════════════════\n\n")
+
+beh_agesex <- scan |>
+  group_by(Age.Class, Sex, Behaviour_Coarse) |>
+  summarise(N = n(), .groups = "drop") |>
+  group_by(Age.Class, Sex) |>
+  mutate(Pct = round(N / sum(N) * 100, 1)) |>
+  ungroup()
+
+groups <- list(
+  c("Adult",    "Female"),
+  c("Adult",    "Male"),
+  c("Subadult", "Female"),
+  c("Subadult", "Male")
+)
+
+cat(sprintf("%-18s", "Behaviour"))
+for (g in groups) {
+  cat(sprintf("  %14s", paste(g[1], g[2])))
+}
+cat("\n")
+cat(strrep("-", 18 + 16 * length(groups)), "\n")
+
+for (b in behs) {
+  cat(sprintf("%-18s", b))
+  for (g in groups) {
+    val <- beh_agesex |>
+      filter(Age.Class == g[1],
+             Sex == g[2],
+             Behaviour_Coarse == b) |>
+      pull(Pct)
+    val <- ifelse(length(val) == 0, 0, val)
+    cat(sprintf("  %13.1f%%", val))
+  }
+  cat("\n")
+}
+cat("\n")
+
+```
+
+```{r}
+
+# ── 8. TIME OF DAY DISTRIBUTION ──────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("8. TIME OF DAY DISTRIBUTION\n")
+cat("══════════════════════════════════════════════\n\n")
+
+hour_dist <- scan |>
+  mutate(hour = as.numeric(format(POSIX, "%H"))) |>
+  group_by(hour) |>
+  summarise(N = n(), .groups = "drop") |>
+  arrange(hour)
+
+cat(sprintf("%-8s  %6s  %6s\n", "Hour", "N", "%"))
+cat(strrep("-", 24), "\n")
+for (i in 1:nrow(hour_dist)) {
+  cat(sprintf("%02d:00     %6d  %5.1f%%\n",
+              hour_dist$hour[i],
+              hour_dist$N[i],
+              hour_dist$N[i] / nrow(scan) * 100))
+}
+cat("\n")
+```
+
+```{r}
+
+# ── 9. SAVE TABLES AS CSV ─────────────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("9. SAVING TABLES\n")
+cat("══════════════════════════════════════════════\n\n")
+
+write.csv(beh_freq,  "table1_behaviour_frequency.csv",  row.names = FALSE)
+write.csv(subgroup,  "table2_subgroup_sizes.csv",        row.names = FALSE)
+write.csv(beh_loc_pct, "table3_behaviour_by_location.csv", row.names = FALSE)
+write.csv(beh_agesex,  "table4_behaviour_by_agesex.csv",   row.names = FALSE)
+
+cat("Saved:\n")
+cat("  table1_behaviour_frequency.csv\n")
+cat("  table2_subgroup_sizes.csv\n")
+cat("  table3_behaviour_by_location.csv\n")
+cat("  table4_behaviour_by_agesex.csv\n\n")
+
+# ── 10. DESCRIPTIVE PLOTS ─────────────────────────────────────────
+cat("══════════════════════════════════════════════\n")
+cat("10. GENERATING DESCRIPTIVE PLOTS\n")
+cat("══════════════════════════════════════════════\n\n")
+
+theme_desc <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.4),
+      strip.text       = element_text(size = 10, face = "bold"),
+      strip.background = element_rect(fill = "grey97", color = "grey88"),
+      axis.text        = element_text(size = 9, color = "grey30"),
+      axis.title       = element_text(size = 10, color = "grey20"),
+      plot.title       = element_text(size = 12, face = "bold", color = "grey10"),
+      plot.subtitle    = element_text(size = 9, color = "grey45"),
+      plot.margin      = unit(c(10, 10, 8, 10), "pt")
+    )
+}
+
+beh_colors <- c(
+  "Rest"           = "#378ADD",
+  "Move"           = "#1D9E75",
+  "Feed/Forage"    = "#D85A30",
+  "Socio-Sexual"   = "#7F77DD",
+  "Human Directed" = "#E24B4A"
+)
+
+# Plot 1 — Behaviour frequency bar chart
+p1 <- ggplot(beh_freq,
+             aes(x    = reorder(Behaviour_Coarse, N),
+                 y    = N,
+                 fill = Behaviour_Coarse)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = paste0(N, " (", Pct, "%)")),
+            hjust = -0.1, size = 3.2, color = "grey25") +
+  scale_fill_manual(values = beh_colors, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.20))) +
+  coord_flip() +
+  labs(
+    title    = "Behavioural frequency distribution",
+    subtitle = sprintf("N = %d total observations", nrow(scan)),
+    x        = NULL,
+    y        = "Number of observations"
+  ) +
+  theme_desc()
+
+ggsave("desc_behaviour_frequency.png",
+       plot = p1, width = 8, height = 5,
+       dpi = 300, bg = "white")
+cat("Saved: desc_behaviour_frequency.png\n")
+
+# Plot 2 — Behaviour by location (stacked bar)
+p2 <- ggplot(beh_loc_pct,
+             aes(x    = Location_Coarse,
+                 y    = Pct,
+                 fill = Behaviour_Coarse)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = ifelse(Pct >= 5,
+                               paste0(Pct, "%"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3.0, color = "white", fontface = "bold") +
+  scale_fill_manual(values = beh_colors, name = "Behaviour") +
+  scale_y_continuous(labels = percent_format(scale = 1)) +
+  labs(
+    title    = "Behavioural composition by location",
+    subtitle = "Human Directed rises dramatically at Roadside",
+    x        = "Location",
+    y        = "Percentage of observations"
+  ) +
+  theme_desc()
+
+ggsave("desc_behaviour_by_location.png",
+       plot = p2, width = 9, height = 6,
+       dpi = 300, bg = "white")
+cat("Saved: desc_behaviour_by_location.png\n")
+
+# Plot 3 — Behaviour by Age x Sex (faceted)
+beh_agesex_plot <- scan |>
+  group_by(Age.Class, Sex, Behaviour_Coarse) |>
+  summarise(N = n(), .groups = "drop") |>
+  group_by(Age.Class, Sex) |>
+  mutate(
+    Pct   = N / sum(N) * 100,
+    Group = paste(Age.Class, Sex)
+  ) |>
+  ungroup() |>
+  mutate(Group = factor(Group,
+                        levels = c("Adult Female", "Adult Male",
+                                   "Subadult Female", "Subadult Male")))
+
+p3 <- ggplot(beh_agesex_plot,
+             aes(x    = Behaviour_Coarse,
+                 y    = Pct,
+                 fill = Behaviour_Coarse)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = paste0(round(Pct, 0), "%")),
+            vjust = -0.4, size = 2.8, color = "grey25") +
+  facet_wrap(~ Group, nrow = 2) +
+  scale_fill_manual(values = beh_colors, guide = "none") +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Behavioural composition by Age and Sex",
+    subtitle = "Human Directed varies across demographic groups",
+    x        = NULL,
+    y        = "Percentage of observations"
+  ) +
+  theme_desc() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8))
+
+ggsave("desc_behaviour_by_agesex.png",
+       plot = p3, width = 11, height = 8,
+       dpi = 300, bg = "white")
+cat("Saved: desc_behaviour_by_agesex.png\n")
+
+# Plot 4 — Subgroup sample sizes heatmap
+subgroup_plot <- subgroup |>
+  mutate(
+    Group    = paste(Age.Class, Sex),
+    Sparse   = N_total < 20,
+    Label    = paste0("n=", N_total)
+  )
+
+p4 <- ggplot(subgroup_plot,
+             aes(x    = Location_Coarse,
+                 y    = paste(Age.Class, Sex),
+                 fill = N_total)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = Label),
+            size     = 3.5,
+            fontface = ifelse(subgroup_plot$Sparse, "bold", "plain"),
+            color    = ifelse(subgroup_plot$N_total > 200,
+                              "white", "grey15")) +
+  scale_fill_gradientn(
+    colors = c("#FAEEDA", "#85B7EB", "#185FA5"),
+    values = c(0, 0.3, 1),
+    name   = "N observations"
+  ) +
+  labs(
+    title    = "Subgroup sample sizes (training set)",
+    subtitle = "Bold = sparse subgroups (N < 20)",
+    x        = "Location",
+    y        = NULL
+  ) +
+  theme_desc()
+
+ggsave("desc_subgroup_sizes.png",
+       plot = p4, width = 8, height = 5,
+       dpi = 300, bg = "white")
+cat("Saved: desc_subgroup_sizes.png\n")
+
+# Plot 5 — Time of day distribution
+hour_beh <- scan |>
+  mutate(hour = as.numeric(format(POSIX, "%H"))) |>
+  group_by(hour, Behaviour_Coarse) |>
+  summarise(N = n(), .groups = "drop") |>
+  group_by(hour) |>
+  mutate(Pct = N / sum(N) * 100) |>
+  ungroup() |>
+  mutate(Behaviour_Coarse = factor(Behaviour_Coarse,
+                                   levels = names(beh_colors)))
+
+p5 <- ggplot(hour_beh,
+             aes(x    = hour,
+                 y    = Pct,
+                 fill = Behaviour_Coarse)) +
+  geom_col(width = 0.85, alpha = 0.9) +
+  scale_fill_manual(values = beh_colors, name = "Behaviour") +
+  scale_x_continuous(
+    breaks = c(8, 10, 12, 14, 16, 18),
+    labels = c("08:00","10:00","12:00",
+               "14:00","16:00","18:00")
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title    = "Behavioural composition across time of day",
+    subtitle = "Stacked bars show proportion of each behaviour at each hour",
+    x        = "Hour of day",
+    y        = "Percentage of observations"
+  ) +
+  theme_desc()
+
+ggsave("desc_time_of_day.png",
+       plot = p5, width = 10, height = 6,
+       dpi = 300, bg = "white")
+cat("Saved: desc_time_of_day.png\n\n")
+
+cat("══════════════════════════════════════════════\n")
+cat("All descriptive statistics complete.\n")
+cat("══════════════════════════════════════════════\n")
+
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
+```{r}
+```
+
+```{r}
+```
+
+
